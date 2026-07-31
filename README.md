@@ -26,6 +26,24 @@ cp .env.example .env
 # заполни реальные значения только локально
 ```
 
+### CI/CD (GitHub Actions)
+
+- **CI** (`.github/workflows/ci.yml`): на push/PR в `develop` и `main` — unit-тесты (`pytest`, без integration).
+- **CD** (`.github/workflows/deploy.yml`): на push в `main` — SSH на prod VM → `git pull` + `scripts/deploy.sh`.
+
+Секреты репозитория (Settings → Secrets → Actions):
+
+| Secret | Пример |
+|--------|--------|
+| `SSH_HOST` | `51.250.104.136` (лучше статичный IP) |
+| `SSH_USER` | `djlazarboy` |
+| `SSH_KEY` | весь private key (файл `djlazarboy`) |
+| `DEPLOY_PATH` | `/opt/job-hunter` (опционально) |
+
+Первый раз на сервере: `bash scripts/server_bootstrap.sh`, заполнить `.env`/`config.yaml`, поставить systemd из `deploy/systemd/`.
+
+На prod фильтр PM лучше через DeepSeek (`agents.yaml` → `is_pm_filter.provider: deepseek`), Ollama на 2 GB VM не ставить.
+
 ---
 
 ## Быстрый старт

@@ -1,0 +1,16 @@
+[Unit]
+Description=Job Hunter score_server
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=djlazarboy
+WorkingDirectory=/opt/job-hunter
+EnvironmentFile=/opt/job-hunter/.env
+ExecStart=/opt/job-hunter/.venv/bin/python score_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

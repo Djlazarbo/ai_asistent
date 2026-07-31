@@ -1,0 +1,16 @@
+[Unit]
+Description=Job Hunter Telegram bot (watchdog)
+After=network.target jobhunter-score.service
+Wants=jobhunter-score.service
+
+[Service]
+Type=simple
+User=djlazarboy
+WorkingDirectory=/opt/job-hunter
+EnvironmentFile=/opt/job-hunter/.env
+ExecStart=/opt/job-hunter/.venv/bin/python watchdog.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Job Hunter Telethon channel monitor
+After=network.target jobhunter-score.service
+
+[Service]
+Type=simple
+User=djlazarboy
+WorkingDirectory=/opt/job-hunter
+EnvironmentFile=/opt/job-hunter/.env
+ExecStart=/opt/job-hunter/.venv/bin/python telethon_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

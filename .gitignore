@@ -1,0 +1,55 @@
+# Secrets & local config
+.env
+.env.*
+!.env.example
+config.yaml
+config.local.yaml
+google_credentials.json
+*.pem
+*.key
+
+# Telethon / sessions
+telethon_session*
+*.session
+*.session-shm
+*.session-wal
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+vacancies.db
+
+# Logs & caches
+*.log
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+
+# n8n exports that may contain tokens
+workflow_live.json
+workflow_backup.json
+workflow_put*.json
+workflow_updated.json
+workflow_optimized.json
+_wf_*.json
+wf_patch.json
+_exec_error.json
+_n8n_db_copy.sqlite
+.n8n_api_key.tmp
+
+# Local dumps / analysis artifacts
+_*.json
+!agents.yaml
+debug_hh.png
+*.xlsx
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

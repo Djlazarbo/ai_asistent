@@ -1,0 +1,51 @@
+# Single source of truth for AI agents in Job Hunter Bot.
+# Edit this file to change defaults; runtime overrides live in DB (settings.agent_overrides).
+# Bot menu /menu → Настройки → 🤖 Агенты writes overrides here at runtime.
+
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1/chat/completions
+    api_key_env: DEEPSEEK_API_KEY
+    timeout: 300
+    models:
+      - deepseek-chat
+      - deepseek-reasoner
+  ollama:
+    base_url: http://127.0.0.1:11434
+    timeout: 300
+    models:
+      - qwen3:14b
+      - qwen2.5:14b
+      - llama3.1:8b
+
+agents:
+  vacancy_analyzer:
+    label: "🤖 Анализ вакансии"
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.3
+  letter_writer:
+    label: "✍️ Сопроводительное"
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.7
+  interview_coach:
+    label: "🎓 Подготовка к интервью"
+    provider: deepseek
+    model: deepseek-reasoner
+    temperature: 0.5
+  profile_extractor:
+    label: "📋 Извлечь профиль из резюме"
+    provider: deepseek
+    model: deepseek-reasoner
+    temperature: 0.3
+  resume_adapter:
+    label: "📝 Адаптация резюме"
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.5
+  is_pm_filter:
+    label: "🔍 Фильтр PM/TPM"
+    provider: ollama
+    model: qwen3:14b
+    temperature: 0

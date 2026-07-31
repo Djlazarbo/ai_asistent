@@ -1,0 +1,62 @@
+# Copy to config.yaml and fill real values. Do NOT commit config.yaml.
+# Secrets can also come from .env (see .env.example).
+
+telegram:
+  api_id: YOUR_TELEGRAM_API_ID
+  api_hash: YOUR_TELEGRAM_API_HASH
+  catchup_limit: 50
+  channels:
+  - '@careerhub_pm'
+  - '@JobOfferInside'
+  - '@projects_jobs'
+  - '@jobs_in_it_remoute'
+  - '@careerstation_pm'
+  - '@projects_jobs_feed'
+  - '@avito_career'
+  - '@zvuk_jobs'
+  - '@hcareers_jobs'
+
+n8n:
+  # stage: http://localhost:5678/webhook/vacancy
+  # prod:  https://your-domain/webhook/vacancy
+  webhook_url: http://localhost:5678/webhook/vacancy
+
+ollama:
+  url: http://127.0.0.1:11434
+  model: qwen3:14b
+  analysis_model: deepseek-chat
+
+deepseek:
+  base_url: https://api.deepseek.com/v1/chat/completions
+  model: deepseek-chat
+  timeout: 300
+
+telegram_bot:
+  token: YOUR_TELEGRAM_BOT_TOKEN
+  chat_id: YOUR_TELEGRAM_CHAT_ID
+
+hh:
+  area_moscow: 1
+  poll_time: "09:00"
+  keywords:
+  - IT project manager
+  - технический менеджер проектов
+  - руководитель IT проектов
+  - менеджер IT проектов
+  - delivery manager
+  - technical program manager
+  - Technical Project Manager
+  - Руководитель проектов
+  - Руководитель проекта
+
+google_sheets:
+  credentials_file: google_credentials.json
+  spreadsheet_id: YOUR_SPREADSHEET_ID
+  sheet_name: Vacancies
+
+db:
+  path: vacancies.db
+
+log:
+  file: job_hunter.log
+  level: INFO

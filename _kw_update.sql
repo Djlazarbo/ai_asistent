@@ -1,0 +1,1 @@
+﻿UPDATE settings SET value='["IT project manager","технический менеджер проектов","руководитель IT проектов","менеджер IT проектов","delivery manager","technical program manager","Technical Project Manager","Руководитель проектов"]' WHERE key='hh_keywords';

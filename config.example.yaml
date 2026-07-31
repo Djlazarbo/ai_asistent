@@ -2,7 +2,7 @@
 # Secrets can also come from .env (see .env.example).
 
 telegram:
-  api_id: YOUR_TELEGRAM_API_ID
+  api_id: 0
   api_hash: YOUR_TELEGRAM_API_HASH
   catchup_limit: 50
   channels:
@@ -32,8 +32,9 @@ deepseek:
   timeout: 300
 
 telegram_bot:
-  token: YOUR_TELEGRAM_BOT_TOKEN
-  chat_id: YOUR_TELEGRAM_CHAT_ID
+  # Replace with real values locally — keep chat_id numeric for imports/tests
+  token: "0000000000:CI_PLACEHOLDER_TOKEN_REPLACE_ME"
+  chat_id: 0
 
 hh:
   area_moscow: 1

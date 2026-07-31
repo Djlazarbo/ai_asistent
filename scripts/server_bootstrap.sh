@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# One-time bootstrap on the Yandex Cloud VM (Ubuntu).
-# Usage (as deploy user with sudo):
-#   curl/git clone then: bash scripts/server_bootstrap.sh
+# One-time bootstrap on the Yandex Cloud VM (Ubuntu) — Docker-only prod.
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/job-hunter}"
@@ -10,12 +8,13 @@ BRANCH="${BRANCH:-main}"
 
 echo "==> Installing packages"
 sudo apt-get update -y
-sudo apt-get install -y git curl ca-certificates python3 python3-venv python3-pip
+sudo apt-get install -y git curl ca-certificates
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "==> Installing Docker"
   curl -fsSL https://get.docker.com | sudo sh
   sudo usermod -aG docker "$USER" || true
+  echo "Log out/in (or newgrp docker) so docker works without sudo, then re-run this script."
 fi
 
 echo "==> Clone repo to $APP_DIR"
@@ -31,37 +30,35 @@ else
 fi
 
 cd "$APP_DIR"
+mkdir -p data
 
 if [ ! -f .env ]; then
   cp .env.example .env
-  echo "EDIT $APP_DIR/.env before starting (DEEPSEEK_API_KEY, POSTGRES_PASSWORD, APP_ENV=prod)"
+  cat >> .env <<'EOF'
+
+# --- prod docker overrides ---
+APP_ENV=prod
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+N8N_WEBHOOK_URL=http://score:5679/webhook/vacancy
+EOF
+  echo "EDIT $APP_DIR/.env (DEEPSEEK_API_KEY, POSTGRES_PASSWORD)"
 fi
 
 if [ ! -f config.yaml ]; then
   cp config.example.yaml config.yaml
-  echo "EDIT $APP_DIR/config.yaml (bot token, chat_id, n8n webhook, telegram api)"
+  echo "EDIT $APP_DIR/config.yaml (prod bot token, chat_id, telegram api_id/hash)"
 fi
 
-python3 -m venv .venv
-# shellcheck disable=SC1091
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-
-echo "==> Start Postgres (prod: localhost bind)"
-export APP_ENV=prod
-if [ -f docker-compose.prod.yml ]; then
-  docker compose -f docker-compose.prod.yml up -d
-else
-  docker compose up -d postgres
-fi
-# Ensure .env has APP_ENV=prod for systemd services
-if ! grep -q '^APP_ENV=' .env 2>/dev/null; then
-  echo 'APP_ENV=prod' >> .env
+if [ ! -f data/telethon_session.session ]; then
+  touch data/telethon_session.session
 fi
 
-echo "==> Done. Next:"
-echo "  1) Fill .env and config.yaml"
-echo "  2) Set is_pm_filter to deepseek in agents.yaml or bot settings"
-echo "  3) bash scripts/deploy.sh"
-echo "  4) Add GitHub secrets SSH_HOST / SSH_USER / SSH_KEY for CD"
+echo "==> Build & start stack"
+docker compose -f docker-compose.prod.yml up -d --build
+
+echo "==> Done."
+echo "  docker compose -f docker-compose.prod.yml ps"
+echo "  curl -s http://127.0.0.1:5679/health"
+echo "  Telethon: first login may need interactive session on host, then copy *.session into data/"
+echo "  Add GitHub secrets SSH_HOST / SSH_USER / SSH_KEY for CD"

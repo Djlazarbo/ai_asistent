@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import functools
 import hashlib
+import os
 import re
 from urllib.parse import quote
 
@@ -26,7 +27,9 @@ _http_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_pr
 with open("config.yaml", encoding="utf-8") as f:
     _config = yaml.safe_load(f)
 
-N8N_WEBHOOK = _config["n8n"]["webhook_url"]
+import os
+
+N8N_WEBHOOK = os.getenv("N8N_WEBHOOK_URL") or _config["n8n"]["webhook_url"]
 GM_BASE = "https://getmatch.ru"
 LOCATIONS = ["moscow", "remote"]
 MAX_PAGES = 3

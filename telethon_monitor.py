@@ -53,7 +53,7 @@ with open("config.yaml", encoding="utf-8") as f:
 
 API_ID = _config["telegram"]["api_id"]
 API_HASH = _config["telegram"]["api_hash"]
-N8N_WEBHOOK = _config["n8n"]["webhook_url"]
+N8N_WEBHOOK = os.getenv("N8N_WEBHOOK_URL") or _config["n8n"]["webhook_url"]
 CATCHUP_LIMIT = _config["telegram"].get("catchup_limit", 50)
 
 

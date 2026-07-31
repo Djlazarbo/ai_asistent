@@ -1,56 +1,49 @@
-# Production deploy (Yandex VM)
+# Production deploy (Yandex VM) — Docker images
+
+## Stack
+
+`docker compose -f docker-compose.prod.yml` builds/runs:
+
+| Container | Image | Role |
+|-----------|--------|------|
+| `jobhunter_postgres` | postgres:16-alpine | DB on `127.0.0.1:5432` |
+| `jobhunter_score` | `jobhunter-app` | filter + DeepSeek + `/webhook/vacancy` |
+| `jobhunter_bot` | `jobhunter-app` | Telegram bot (watchdog) |
+| `jobhunter_poller` | `jobhunter-poller` | hh/habr/getmatch (Playwright) |
+| `jobhunter_telethon` | `jobhunter-app` | TG channels |
+
+No n8n / Ollama on the VM. Pollers POST to `http://score:5679/webhook/vacancy`.
 
 ## Prerequisites
 
-1. SSH access works:
-   ```bash
-   ssh -i ~/.ssh/djlazarboy djlazarboy@YOUR_STATIC_IP
-   ```
-   Or add this PC pubkey in Yandex Console → VM → SSH keys:
-   `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBB+fTcAGbGH7quDw4nYG6KNppd21E9rxbRsrNk2h71u drago@DJlazarenko`
+1. SSH access restored (see Yandex recovery docs if key lost).
+2. Static public IP recommended.
+3. Secrets: rotate items in [SECURITY.md](SECURITY.md).
 
-2. Prefer a **static** public IP (Dynamic IP breaks CD).
-
-3. Rotate secrets listed in [SECURITY.md](SECURITY.md).
-
-## One-time bootstrap on the VM
+## One-time bootstrap
 
 ```bash
-# as djlazarboy
+ssh djlazarboy@YOUR_IP
 sudo mkdir -p /opt/job-hunter && sudo chown $USER:$USER /opt/job-hunter
 git clone -b main https://github.com/Djlazarbo/ai_asistent.git /opt/job-hunter
 cd /opt/job-hunter
 bash scripts/server_bootstrap.sh
-# edit .env (APP_ENV=prod, DEEPSEEK_API_KEY, POSTGRES_*) and config.yaml (prod bot token)
-sudo cp deploy/systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now jobhunter-score jobhunter-bot jobhunter-poller jobhunter-telethon
+# edit .env and config.yaml, then:
 bash scripts/deploy.sh
 curl -s http://127.0.0.1:5679/health
+docker compose -f docker-compose.prod.yml ps
 ```
 
-Postgres is bound to `127.0.0.1:5432` via `docker-compose.prod.yml`.
+Telethon: create session once (local or interactive), put `data/telethon_session.session` on the server.
 
-`APP_ENV=prod` loads `agents.prod.yaml` (DeepSeek for PM filter — no Ollama).
+## GitHub Actions CD
 
-## GitHub Actions CD secrets
+Secrets: `SSH_HOST`, `SSH_USER`, `SSH_KEY`, optional `DEPLOY_PATH=/opt/job-hunter`.  
+Deploy runs `git reset --hard origin/main` + `scripts/deploy.sh` → `docker compose up -d --build`.
 
-Repo → Settings → Secrets and variables → Actions:
+## Smoke
 
-| Name | Value |
-|------|--------|
-| `SSH_HOST` | VM public IP |
-| `SSH_USER` | `djlazarboy` |
-| `SSH_KEY` | full private key PEM/OpenSSH contents |
-| `DEPLOY_PATH` | `/opt/job-hunter` (optional) |
-
-Also create Environment `production` (referenced by deploy workflow).
-
-After secrets exist, push to `main` or run **Deploy prod** → Run workflow.
-
-## Smoke checklist
-
-- [ ] `systemctl is-active jobhunter-score jobhunter-bot jobhunter-poller`
-- [ ] `curl -s localhost:5679/health` → ok
+- [ ] `docker compose -f docker-compose.prod.yml ps` — all Up
+- [ ] `curl -s localhost:5679/health` → `{"status":"ok"}`
 - [ ] Telegram `/start` on **prod** bot
-- [ ] Stage PC still uses local `start.bat` + Ollama + n8n
+- [ ] Stage PC unchanged: `docker-compose.yml` + `start.bat` + local n8n

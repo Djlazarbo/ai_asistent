@@ -50,8 +50,12 @@ _n8n_db_copy.sqlite
 # Local dumps / analysis artifacts
 _*.json
 !agents.yaml
+!agents.prod.yaml
 debug_hh.png
 *.xlsx
+
+# Runtime data on server (sessions)
+data/
 
 # OS
 Thumbs.db

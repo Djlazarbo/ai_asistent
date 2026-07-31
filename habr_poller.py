@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import functools
 import hashlib
+import os
 import re
 from html.parser import HTMLParser
 from urllib.parse import quote
@@ -25,7 +26,7 @@ with open("config.yaml", encoding="utf-8") as f:
     _config = yaml.safe_load(f)
 
 HABR_RSS = "https://career.habr.com/vacancies/rss?q={keyword}&type=all"
-N8N_WEBHOOK = _config["n8n"]["webhook_url"]
+N8N_WEBHOOK = os.getenv("N8N_WEBHOOK_URL") or _config["n8n"]["webhook_url"]
 
 # ── Title pre-filter (same logic as getmatch_poller) ──────────────────────────
 

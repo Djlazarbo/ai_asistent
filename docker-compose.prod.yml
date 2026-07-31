@@ -1,15 +1,14 @@
-# Production stack — Postgres only, bound to localhost (no public DB / no pgAdmin).
-# Usage on server:
-#   docker compose -f docker-compose.prod.yml up -d
+# Full production stack as Docker images (no n8n, no Ollama on the VM).
+# Usage:
+#   cp .env.example .env && cp config.example.yaml config.yaml   # fill secrets
+#   docker compose -f docker-compose.prod.yml up -d --build
 #
-# Stage on PC keeps using docker-compose.yml (ports 5433 + pgAdmin 5050).
-
-version: "3.9"
+# Stage on PC: keep using docker-compose.yml (Postgres+pgAdmin only) + start.bat.
 
 services:
   postgres:
     image: postgres:16-alpine
-    restart: always
+    restart: unless-stopped
     container_name: jobhunter_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-jobhunter}
@@ -25,6 +24,87 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  score:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jobhunter-app:latest
+    restart: unless-stopped
+    container_name: jobhunter_score
+    command: ["python", "score_server.py"]
+    env_file: [.env]
+    environment:
+      APP_ENV: prod
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:5679:5679"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5679/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    image: jobhunter-app:latest
+    restart: unless-stopped
+    container_name: jobhunter_bot
+    command: ["python", "watchdog.py"]
+    env_file: [.env]
+    environment:
+      APP_ENV: prod
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      N8N_WEBHOOK_URL: http://score:5679/webhook/vacancy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      score:
+        condition: service_healthy
+
+  poller:
+    build:
+      context: .
+      dockerfile: Dockerfile.poller
+    image: jobhunter-poller:latest
+    restart: unless-stopped
+    container_name: jobhunter_poller
+    command: ["python", "hh_poller.py", "--daemon"]
+    env_file: [.env]
+    environment:
+      APP_ENV: prod
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      N8N_WEBHOOK_URL: http://score:5679/webhook/vacancy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      score:
+        condition: service_healthy
+
+  telethon:
+    image: jobhunter-app:latest
+    restart: unless-stopped
+    container_name: jobhunter_telethon
+    command: ["python", "telethon_monitor.py"]
+    env_file: [.env]
+    environment:
+      APP_ENV: prod
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      N8N_WEBHOOK_URL: http://score:5679/webhook/vacancy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data/telethon_session.session:/app/telethon_session.session
+    depends_on:
+      score:
+        condition: service_healthy
 
 volumes:
   postgres_data:

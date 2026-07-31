@@ -1,0 +1,19 @@
+# Poller image: Playwright Chromium for hh.ru scraping.
+FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY agents.py agents.yaml agents.prod.yaml ai.py \
+     db_postgres.py prompts.py sheets.py \
+     hh_poller.py habr_poller.py getmatch_poller.py ./
+
+ENV APP_ENV=prod \
+    PYTHONUNBUFFERED=1 \
+    POSTGRES_HOST=postgres \
+    POSTGRES_PORT=5432 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+CMD ["python", "hh_poller.py", "--daemon"]

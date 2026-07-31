@@ -4,7 +4,20 @@ Tests for scheduled jobs and retry logic in bot.py.
 Run: pytest test_scheduled_jobs.py -v
 """
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+@contextmanager
+def _fast_send_patches(pending, profile, send_mock):
+    """Avoid real DeepSeek/Ollama waits when exercising _do_retry_scoring."""
+    with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=pending)), \
+         patch("db_postgres.get_active_profile", new=AsyncMock(return_value=profile)), \
+         patch("db_postgres.get_vacancy_by_external", new=AsyncMock(return_value={"status": "new"})), \
+         patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)), \
+         patch("bot.asyncio.sleep", new=AsyncMock()), \
+         patch("hh_poller._send_to_n8n", send_mock):
+        yield
 
 
 # ── _do_retry_scoring ─────────────────────────────────────────────────────────
@@ -34,9 +47,7 @@ class TestDoRetryScoring:
         vacancies = [self._make_vacancy(f"ext_{i}") for i in range(5)]
         mock_send = AsyncMock()
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=vacancies)), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", mock_send):
+        with _fast_send_patches(vacancies, {}, mock_send):
             result = await _do_retry_scoring(batch=0)
 
         assert result["total"] == 5
@@ -48,12 +59,9 @@ class TestDoRetryScoring:
         vacancies = [self._make_vacancy(f"ext_{i}") for i in range(10)]
         mock_send = AsyncMock()
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=vacancies)), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", mock_send):
+        with _fast_send_patches(vacancies, {}, mock_send):
             result = await _do_retry_scoring(batch=3)
 
-        # Implementation slices pending before tracking total, so total == batch
         assert result["sent"] == 3
         assert result["total"] == 3
         assert mock_send.call_count == 3
@@ -66,13 +74,11 @@ class TestDoRetryScoring:
         async def capture_send(payload):
             captured.append(payload)
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[vacancy])), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", capture_send):
+        with _fast_send_patches([vacancy], {}, capture_send):
             await _do_retry_scoring()
 
         assert len(captured) == 1
-        assert "description" in captured[0], "payload must include 'description' for n8n"
+        assert "description" in captured[0]
 
     async def test_payload_includes_message_text_field(self):
         from bot import _do_retry_scoring
@@ -82,12 +88,10 @@ class TestDoRetryScoring:
         async def capture_send(payload):
             captured.append(payload)
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[vacancy])), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", capture_send):
+        with _fast_send_patches([vacancy], {}, capture_send):
             await _do_retry_scoring()
 
-        assert "message_text" in captured[0], "payload must include 'message_text' for telegram poller"
+        assert "message_text" in captured[0]
 
     async def test_description_and_message_text_equal_vacancy_text(self):
         from bot import _do_retry_scoring
@@ -97,9 +101,7 @@ class TestDoRetryScoring:
         async def capture_send(payload):
             captured.append(payload)
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[vacancy])), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", capture_send):
+        with _fast_send_patches([vacancy], {}, capture_send):
             await _do_retry_scoring()
 
         p = captured[0]
@@ -114,9 +116,7 @@ class TestDoRetryScoring:
         async def capture_send(payload):
             captured.append(payload)
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[vacancy])), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", capture_send):
+        with _fast_send_patches([vacancy], {}, capture_send):
             await _do_retry_scoring()
 
         assert captured[0]["external_id"] == "my_ext_123"
@@ -131,9 +131,7 @@ class TestDoRetryScoring:
         async def capture_send(payload):
             captured.append(payload)
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[vacancy])), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value=profile)), \
-             patch("hh_poller._send_to_n8n", capture_send):
+        with _fast_send_patches([vacancy], profile, capture_send):
             await _do_retry_scoring()
 
         assert captured[0]["active_profile"] == profile
@@ -149,12 +147,9 @@ class TestDoRetryScoring:
             if call_count == 2:
                 raise Exception("n8n timeout")
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=vacancies)), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value={})), \
-             patch("hh_poller._send_to_n8n", flaky_send):
+        with _fast_send_patches(vacancies, {}, flaky_send):
             result = await _do_retry_scoring()
 
-        # 3 total, 2 sent successfully (1 errored)
         assert result["total"] == 3
         assert result["sent"] == 2
 
@@ -166,9 +161,7 @@ class TestDoRetryScoring:
         async def capture_send(payload):
             captured.append(payload)
 
-        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[vacancy])), \
-             patch("db_postgres.get_active_profile", new=AsyncMock(return_value=None)), \
-             patch("hh_poller._send_to_n8n", capture_send):
+        with _fast_send_patches([vacancy], None, capture_send):
             result = await _do_retry_scoring()
 
         assert result["sent"] == 1
@@ -183,11 +176,21 @@ class TestRetryScoringJob:
         ctx.bot.send_message = AsyncMock()
         return ctx
 
+    def _ollama_job_patches(self, pending_count, retry_mock):
+        return (
+            patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[{"id": i} for i in range(pending_count)])),
+            patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)),
+            patch("bot._do_retry_scoring", retry_mock),
+        )
+
     async def test_notifies_when_sent_gt_zero(self):
         from bot import retry_scoring_job
         ctx = self._make_context()
+        retry = AsyncMock(return_value={"total": 5, "sent": 3})
 
-        with patch("bot._do_retry_scoring", new=AsyncMock(return_value={"total": 5, "sent": 3})):
+        with self._ollama_job_patches(5, retry)[0], \
+             self._ollama_job_patches(5, retry)[1], \
+             self._ollama_job_patches(5, retry)[2]:
             await retry_scoring_job(ctx)
 
         ctx.bot.send_message.assert_called_once()
@@ -197,8 +200,11 @@ class TestRetryScoringJob:
     async def test_no_notification_when_sent_zero(self):
         from bot import retry_scoring_job
         ctx = self._make_context()
+        retry = AsyncMock(return_value={"total": 0, "sent": 0})
 
-        with patch("bot._do_retry_scoring", new=AsyncMock(return_value={"total": 0, "sent": 0})):
+        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[])), \
+             patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)), \
+             patch("bot._do_retry_scoring", retry):
             await retry_scoring_job(ctx)
 
         ctx.bot.send_message.assert_not_called()
@@ -208,7 +214,9 @@ class TestRetryScoringJob:
         ctx = self._make_context()
         mock_retry = AsyncMock(return_value={"total": 0, "sent": 0})
 
-        with patch("bot._do_retry_scoring", mock_retry):
+        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[{"id": 1}])), \
+             patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)), \
+             patch("bot._do_retry_scoring", mock_retry):
             await retry_scoring_job(ctx)
 
         mock_retry.assert_called_once_with(batch=_SCORE_BATCH)
@@ -217,15 +225,18 @@ class TestRetryScoringJob:
         from bot import retry_scoring_job
         ctx = self._make_context()
 
-        with patch("bot._do_retry_scoring", new=AsyncMock(side_effect=Exception("DB down"))):
-            # Must not raise
+        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(side_effect=Exception("DB down"))), \
+             patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)):
             await retry_scoring_job(ctx)
 
     async def test_notification_mentions_total_count(self):
         from bot import retry_scoring_job
         ctx = self._make_context()
+        retry = AsyncMock(return_value={"total": 20, "sent": 10})
 
-        with patch("bot._do_retry_scoring", new=AsyncMock(return_value={"total": 20, "sent": 10})):
+        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[{"id": i} for i in range(20)])), \
+             patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)), \
+             patch("bot._do_retry_scoring", retry):
             await retry_scoring_job(ctx)
 
         msg_text = ctx.bot.send_message.call_args[1]["text"]
@@ -234,8 +245,11 @@ class TestRetryScoringJob:
     async def test_sends_to_owner_chat_id(self):
         from bot import retry_scoring_job, OWNER_CHAT_ID
         ctx = self._make_context()
+        retry = AsyncMock(return_value={"total": 5, "sent": 2})
 
-        with patch("bot._do_retry_scoring", new=AsyncMock(return_value={"total": 5, "sent": 2})):
+        with patch("db_postgres.get_pending_vacancies", new=AsyncMock(return_value=[{"id": 1}])), \
+             patch("bot._filter_is_deepseek", new=AsyncMock(return_value=False)), \
+             patch("bot._do_retry_scoring", retry):
             await retry_scoring_job(ctx)
 
         kwargs = ctx.bot.send_message.call_args[1]

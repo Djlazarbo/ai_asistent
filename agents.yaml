@@ -1,6 +1,6 @@
-# Single source of truth for AI agents in Job Hunter Bot.
-# Edit this file to change defaults; runtime overrides live in DB (settings.agent_overrides).
-# Bot menu /menu → Настройки → 🤖 Агенты writes overrides here at runtime.
+# Stage defaults (PC). is_pm_filter uses local Ollama.
+# Prod uses agents.prod.yaml when APP_ENV=prod (see agents.py).
+# Runtime overrides: DB settings.agent_overrides via bot menu.
 
 providers:
   deepseek:
@@ -20,32 +20,32 @@ providers:
 
 agents:
   vacancy_analyzer:
-    label: "🤖 Анализ вакансии"
+    label: "Анализ вакансии"
     provider: deepseek
     model: deepseek-chat
     temperature: 0.3
   letter_writer:
-    label: "✍️ Сопроводительное"
+    label: "Сопроводительное"
     provider: deepseek
     model: deepseek-chat
     temperature: 0.7
   interview_coach:
-    label: "🎓 Подготовка к интервью"
+    label: "Подготовка к интервью"
     provider: deepseek
     model: deepseek-reasoner
     temperature: 0.5
   profile_extractor:
-    label: "📋 Извлечь профиль из резюме"
+    label: "Извлечь профиль из резюме"
     provider: deepseek
     model: deepseek-reasoner
     temperature: 0.3
   resume_adapter:
-    label: "📝 Адаптация резюме"
+    label: "Адаптация резюме"
     provider: deepseek
     model: deepseek-chat
     temperature: 0.5
   is_pm_filter:
-    label: "🔍 Фильтр PM/TPM"
+    label: "Фильтр PM/TPM"
     provider: ollama
     model: qwen3:14b
     temperature: 0

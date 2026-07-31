@@ -633,28 +633,28 @@ class TestOllamaFilter:
     @pytest.mark.asyncio
     async def test_returns_true_on_yes(self):
         import ai
-        with patch("ai._ollama_generate", new=AsyncMock(return_value="YES")):
+        with patch("ai.call_agent", new=AsyncMock(return_value="YES")):
             result = await ai.ollama_filter("Is this a PM role?")
         assert result is True
 
     @pytest.mark.asyncio
     async def test_returns_false_on_no(self):
         import ai
-        with patch("ai._ollama_generate", new=AsyncMock(return_value="NO")):
+        with patch("ai.call_agent", new=AsyncMock(return_value="NO")):
             result = await ai.ollama_filter("Is this a PM role?")
         assert result is False
 
     @pytest.mark.asyncio
     async def test_returns_false_on_error(self):
         import ai
-        with patch("ai._ollama_generate", new=AsyncMock(side_effect=Exception("timeout"))):
+        with patch("ai.call_agent", new=AsyncMock(side_effect=Exception("timeout"))):
             result = await ai.ollama_filter("Any prompt")
         assert result is False
 
     @pytest.mark.asyncio
     async def test_case_insensitive_yes(self):
         import ai
-        with patch("ai._ollama_generate", new=AsyncMock(return_value="yes, definitely")):
+        with patch("ai.call_agent", new=AsyncMock(return_value="yes, definitely")):
             result = await ai.ollama_filter("prompt")
         assert result is True
 
@@ -674,7 +674,7 @@ class TestAnalyzeVacancy:
             "red_flags": [],
             "match_summary": "Great fit",
         })
-        with patch("ai.ollama_chat", new=AsyncMock(return_value=mock_response)):
+        with patch("ai.call_agent", new=AsyncMock(return_value=mock_response)):
             result = await ai.analyze_vacancy("TPM role at TestCo", sample_profile)
         assert result["score"] == 9
         assert "pros" in result
@@ -687,11 +687,11 @@ class TestAnalyzeVacancy:
         long_text = "A" * 10000
         captured = []
 
-        async def mock_chat(prompt, temperature=0.3):
+        async def mock_agent(role, prompt, temperature=None):
             captured.append(prompt)
             return '{"score":5,"title":"","company":"","salary":"","format":"","pros":[],"cons":[],"red_flags":[],"match_summary":""}'
 
-        with patch("ai.ollama_chat", new=mock_chat):
+        with patch("ai.call_agent", new=mock_agent):
             await ai.analyze_vacancy(long_text, sample_profile)
 
         assert len(captured) == 1
@@ -717,7 +717,7 @@ class TestExtractProfile:
             "languages": ["ru"],
             "summary": "Good PM",
         })
-        with patch("ai.ollama_chat", new=AsyncMock(return_value=mock_response)):
+        with patch("ai.call_agent", new=AsyncMock(return_value=mock_response)):
             result = await ai.extract_profile("My resume text")
         assert result["name"] == "Test User"
         assert result["experience_years"] == 5
@@ -730,6 +730,7 @@ class TestExtractProfile:
 SCORE_SERVER_URL = "http://localhost:5679"
 
 
+@pytest.mark.integration
 class TestScoreServer:
     def test_health_endpoint(self):
         resp = requests.get(f"{SCORE_SERVER_URL}/health", timeout=5)
@@ -911,14 +912,18 @@ class TestN8nPipeline:
 # SECTION 7: N8N WORKFLOW CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.integration
 class TestN8nWorkflowConfig:
-    N8N_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI4MWNkYTA5NC1iZTkzLTQ5YTAtODc1Zi1iMDI1YzgyNTRkMTUiLCJpc3MiOiJuOG4iLCJhdWQiOiJwdWJsaWMtYXBpIiwianRpIjoiNWY3YTliMTItYzExZC00OTk4LThkOGItZmFlMzcyOWUyNzc4IiwiaWF0IjoxNzczNTkxNjM5LCJleHAiOjE3ODEzMjMyMDB9.VCoF8Zs4RrfTL-ST6pIuVbxpAjXUGS84eCzu5erHUMc"
+    """Requires live n8n + N8N_API_KEY env (never hardcode keys in tests)."""
     WF_ID = "4zlvC9yoSJH3YO5I"
 
     def _get_workflow(self):
+        key = os.environ.get("N8N_API_KEY")
+        if not key:
+            pytest.skip("N8N_API_KEY not set")
         resp = requests.get(
             f"http://localhost:5678/api/v1/workflows/{self.WF_ID}",
-            headers={"X-N8N-API-KEY": self.N8N_KEY},
+            headers={"X-N8N-API-KEY": key},
             timeout=10,
         )
         assert resp.status_code == 200

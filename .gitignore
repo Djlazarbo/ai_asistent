@@ -6,7 +6,11 @@ config.yaml
 config.local.yaml
 google_credentials.json
 *.pem
-*.key
+# SSH / cloud keys (never commit)
+id_rsa
+id_ed25519
+djlazarboy
+*.ppk
 
 # Telethon / sessions
 telethon_session*

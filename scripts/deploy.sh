@@ -21,8 +21,13 @@ if [ ! -f .env ] || [ ! -f config.yaml ]; then
   exit 1
 fi
 
-echo "==> Postgres"
-docker compose up -d postgres
+echo "==> Postgres (prod compose, localhost only)"
+export APP_ENV="${APP_ENV:-prod}"
+if [ -f docker-compose.prod.yml ]; then
+  docker compose -f docker-compose.prod.yml up -d
+else
+  docker compose up -d postgres
+fi
 
 # Optional systemd units if installed
 for unit in jobhunter-score jobhunter-bot jobhunter-poller jobhunter-telethon; do

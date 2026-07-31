@@ -1028,8 +1028,8 @@ async def _do_retry_scoring(batch: int = _SCORE_BATCH) -> dict:
     profile = await db.get_active_profile() or {}
     sent = 0
     for v in pending:
-        await _send_one_and_wait(v, profile)
-        sent += 1
+        if await _send_one_and_wait(v, profile):
+            sent += 1
     logger.info(f"retry_scoring: sent {sent}/{len(pending)} pending vacancies to n8n")
     return {"total": len(pending), "sent": sent}
 

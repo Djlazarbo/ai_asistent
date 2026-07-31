@@ -1,0 +1,30 @@
+# Production stack — Postgres only, bound to localhost (no public DB / no pgAdmin).
+# Usage on server:
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Stage on PC keeps using docker-compose.yml (ports 5433 + pgAdmin 5050).
+
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    container_name: jobhunter_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jobhunter}
+      POSTGRES_USER: ${POSTGRES_USER:-jobhunter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

@@ -8,6 +8,7 @@ Type=simple
 User=djlazarboy
 WorkingDirectory=/opt/job-hunter
 EnvironmentFile=/opt/job-hunter/.env
+Environment=APP_ENV=prod
 ExecStart=/opt/job-hunter/.venv/bin/python watchdog.py
 Restart=always
 RestartSec=5

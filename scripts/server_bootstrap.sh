@@ -48,8 +48,17 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-echo "==> Start Postgres"
-docker compose up -d postgres
+echo "==> Start Postgres (prod: localhost bind)"
+export APP_ENV=prod
+if [ -f docker-compose.prod.yml ]; then
+  docker compose -f docker-compose.prod.yml up -d
+else
+  docker compose up -d postgres
+fi
+# Ensure .env has APP_ENV=prod for systemd services
+if ! grep -q '^APP_ENV=' .env 2>/dev/null; then
+  echo 'APP_ENV=prod' >> .env
+fi
 
 echo "==> Done. Next:"
 echo "  1) Fill .env and config.yaml"

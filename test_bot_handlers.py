@@ -347,54 +347,54 @@ class TestStatsFunnelText:
 # ── cover letter uses _profile_to_text ────────────────────────────────────────
 
 class TestCoverLetterUsesProfile:
-    async def test_generate_cover_letter_uses_all_achievements(self, sample_profile):
-        """cover letter prompt must include all achievements, not just first 5000 chars."""
+    async def test_generate_cover_letter_passes_resume_and_vacancy(self, sample_profile):
+        """Cover letter builds prompt from resume_text + vacancy + examples via call_agent."""
         import ai
-        captured_prompts = []
+        captured = []
 
-        async def mock_chat(prompt, temperature=0.3):
-            captured_prompts.append(prompt)
+        async def mock_agent(role, prompt, temperature=None):
+            captured.append((role, prompt))
             return "Mock letter text"
 
-        with patch("ai.ollama_chat", new=mock_chat):
-            await ai.generate_cover_letter("Test vacancy", sample_profile)
+        resume = "Achievement: " + sample_profile["key_achievements"][0]
+        with patch("ai.call_agent", new=mock_agent), \
+             patch("ai._get_resume_text", new=AsyncMock(return_value=resume)), \
+             patch("db_postgres.get_cover_examples", new=AsyncMock(return_value="ex1")):
+            await ai.generate_cover_letter("Test vacancy TPM", sample_profile)
 
-        # At least the letter_prompt (second call) should have all achievements
-        all_prompts_text = " ".join(captured_prompts)
-        for ach in sample_profile["key_achievements"]:
-            assert ach in all_prompts_text, (
-                f"Achievement not found in any prompt: {ach!r}"
-            )
+        assert captured
+        role, prompt = captured[0]
+        assert role == "letter_writer"
+        assert "Test vacancy TPM" in prompt
+        assert resume in prompt
+        assert "ex1" in prompt
 
-    async def test_generate_cover_letter_short_uses_all_achievements(self, sample_profile):
+    async def test_generate_cover_letter_short_uses_resume_text(self, sample_profile):
         import ai
-        captured_prompts = []
+        captured = []
 
-        async def mock_chat(prompt, temperature=0.3):
-            captured_prompts.append(prompt)
+        async def mock_agent(role, prompt, temperature=None):
+            captured.append(prompt)
             return "Mock short letter"
 
-        with patch("ai.ollama_chat", new=mock_chat):
-            await ai.generate_cover_letter_short("Test vacancy", sample_profile)
+        resume = "Short resume with " + sample_profile["key_achievements"][0]
+        with patch("ai.call_agent", new=mock_agent), \
+             patch("ai._get_resume_text", new=AsyncMock(return_value=resume)):
+            await ai.generate_cover_letter_short("Vacancy X", sample_profile)
 
-        all_prompts_text = " ".join(captured_prompts)
-        for ach in sample_profile["key_achievements"]:
-            assert ach in all_prompts_text, (
-                f"Achievement not found in short letter prompt: {ach!r}"
-            )
+        assert captured
+        assert "Vacancy X" in captured[0]
+        assert resume in captured[0]
 
-    async def test_cover_letter_does_not_call_db_for_resume_text(self, sample_profile):
-        """generate_cover_letter must NOT fetch raw resume_text from DB."""
+    async def test_cover_letter_loads_resume_text_from_db(self, sample_profile):
+        """generate_cover_letter uses resume_text from settings (via _get_resume_text)."""
         import ai
-        mock_db_get = AsyncMock()
+        mock_get = AsyncMock(side_effect=lambda key: "FULL RESUME TEXT" if key == "resume_text" else None)
 
-        with patch("ai.ollama_chat", new=AsyncMock(return_value="Letter text")), \
-             patch("db_postgres.get_setting", mock_db_get):
+        with patch("ai.call_agent", new=AsyncMock(return_value="Letter text")), \
+             patch("db_postgres.get_setting", mock_get), \
+             patch("db_postgres.get_cover_examples", new=AsyncMock(return_value="")):
             await ai.generate_cover_letter("Some vacancy", sample_profile)
 
-        # get_setting should not be called with "resume_text"
-        for call in mock_db_get.call_args_list:
-            args = call[0]
-            assert args[0] != "resume_text", (
-                "cover letter should use profile, not raw resume_text from DB"
-            )
+        keys = [c[0][0] for c in mock_get.call_args_list]
+        assert "resume_text" in keys

@@ -14,8 +14,20 @@ from loguru import logger
 
 load_dotenv()
 
-with open("agents.yaml", encoding="utf-8") as f:
+
+def _agents_config_path() -> str:
+    explicit = os.getenv("AGENTS_CONFIG")
+    if explicit:
+        return explicit
+    if os.getenv("APP_ENV", "stage").lower() == "prod":
+        return "agents.prod.yaml"
+    return "agents.yaml"
+
+
+_AGENTS_PATH = _agents_config_path()
+with open(_AGENTS_PATH, encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
+logger.info("Loaded agent config from {}", _AGENTS_PATH)
 
 PROVIDERS: dict = _cfg["providers"]
 AGENTS: dict = _cfg["agents"]

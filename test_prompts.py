@@ -16,8 +16,8 @@ _PROMPTS_AND_VARS = [
     ("DEEPSEEK_EXTRACT_PROFILE", ["resume_text"]),
     ("INTERVIEW_PREP_PROMPT", ["vacancy_text", "resume_text", "interview_history"]),
     ("RESUME_ADAPT_PROMPT", ["vacancy_text", "resume_text"]),
-    ("COVER_LETTER_PROMPT", ["resume_text", "vacancy_text"]),
-    ("COVER_LETTER_SHORT_PROMPT", ["active_profile", "vacancy_text"]),
+    ("COVER_LETTER_PROMPT", ["resume_text", "vacancy_text", "cover_examples"]),
+    ("COVER_LETTER_SHORT_PROMPT", ["resume_text", "vacancy_text"]),
 ]
 
 _ALL_PROMPT_NAMES = [name for name, _ in _PROMPTS_AND_VARS]

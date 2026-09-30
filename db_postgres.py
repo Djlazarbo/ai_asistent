@@ -1303,6 +1303,16 @@ async def followup_mark_reminded(chat_id: int, vacancy_id: str) -> None:
     await _conn_call(user_data.patch_followup_meta, int(chat_id), _mut)
 
 
+async def followup_clear(chat_id: int, vacancy_id: str) -> None:
+    import user_data
+    from followup_meta import clear_entry
+
+    def _mut(meta):
+        return clear_entry(meta, vacancy_id)
+
+    await _conn_call(user_data.patch_followup_meta, int(chat_id), _mut)
+
+
 async def get_favorites(limit: int = 5, offset: int = 0):
     cid = _cid()
     if _mu() and cid is not None:

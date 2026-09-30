@@ -103,6 +103,12 @@ def mark_reminded(
     return meta
 
 
+def clear_entry(meta: dict[str, dict], vacancy_id: str) -> dict[str, dict]:
+    """Drop follow-up state (e.g. after fresh apply)."""
+    meta.pop(str(vacancy_id), None)
+    return meta
+
+
 def parse_follow_up_days(raw: Optional[str], default: int = DEFAULT_FOLLOW_UP_DAYS) -> int:
     try:
         d = int(str(raw or default).strip())

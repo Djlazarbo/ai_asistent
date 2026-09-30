@@ -98,6 +98,30 @@ def _followup_text(title: str) -> str:
     )
 
 
+def _is_followup_reminder_message(query) -> bool:
+    """True for push reminder cards; False for main menu / other UIs."""
+    try:
+        text = (query.message.text or "") if query.message else ""
+    except Exception:
+        return False
+    return text.startswith("⏰") or "Что сделать?" in text
+
+
+async def _ack_followup_action(query, text: str) -> None:
+    """Ack without wiping the main menu when action came from menu buttons."""
+    if _is_followup_reminder_message(query):
+        try:
+            await query.edit_message_text(text)
+            return
+        except Exception:
+            pass
+    # From menu / other screens: keep keyboard, just reply
+    try:
+        await query.message.reply_text(text)
+    except Exception:
+        pass
+
+
 async def _stats_funnel_text() -> str:
     s = await db.get_stats_30days()
     total    = s.get("total", 0)
@@ -3277,10 +3301,11 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text(
             f"✉️ Follow-up письмо (напоминание через 7 дн.):\n\n{letter}"
         )
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        if _is_followup_reminder_message(query):
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         return
 
     if data.startswith("fu_snooze_"):
@@ -3290,10 +3315,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             await db.followup_snooze(chat_id, ext, days=7)
         except Exception as e:
             logger.warning(f"fu_snooze: {e}")
-        try:
-            await query.edit_message_text("⏳ Ок, напомню через 7 дней.")
-        except Exception:
-            await query.message.reply_text("⏳ Ок, напомню через 7 дней.")
+        await _ack_followup_action(query, "⏳ Ок, напомню через 7 дней.")
         return
 
     if data.startswith("fu_interview_"):
@@ -3307,10 +3329,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             await db.followup_dismiss(update.effective_chat.id, ext)
         except Exception:
             pass
-        try:
-            await query.edit_message_text("🤝 Статус: интервью / ответили. Напоминания выкл.")
-        except Exception:
-            await query.message.reply_text("🤝 Статус: интервью / ответили.")
+        await _ack_followup_action(query, "🤝 Статус: интервью / ответили. Напоминания выкл.")
         return
 
     if data.startswith("fu_reject_"):
@@ -3324,10 +3343,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             await db.followup_dismiss(update.effective_chat.id, ext)
         except Exception:
             pass
-        try:
-            await query.edit_message_text("🗑 Помечено как неактуально. Напоминания выкл.")
-        except Exception:
-            await query.message.reply_text("🗑 Помечено как неактуально.")
+        await _ack_followup_action(query, "🗑 Помечено как неактуально. Напоминания выкл.")
         return
 
     if data.startswith("closefollowup_"):
@@ -3337,10 +3353,7 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             await db.followup_dismiss(chat_id, ext)
         except Exception as e:
             logger.warning(f"closefollowup dismiss: {e}")
-        try:
-            await query.edit_message_text("🔕 Напоминания по этой вакансии выключены.")
-        except Exception:
-            pass
+        await _ack_followup_action(query, "🔕 Напоминания по этой вакансии выключены.")
         return
 
     if data.startswith("editcover_"):
@@ -3445,7 +3458,14 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action == "track":
         await db.update_vacancy_status(external_id, "applied")
-        sheets.update_status(external_id, "applied")
+        try:
+            sheets.update_status(external_id, "applied")
+        except Exception:
+            pass
+        try:
+            await db.followup_clear(update.effective_chat.id, external_id)
+        except Exception:
+            pass
         await query.message.reply_text(
             "✅ Отклик зафиксирован! Вакансия перемещена в 'applied'.",
             reply_markup=InlineKeyboardMarkup([

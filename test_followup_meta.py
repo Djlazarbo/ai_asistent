@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 
 from followup_meta import (
+    clear_entry,
     mark_dismissed,
     mark_reminded,
     mark_snoozed,
@@ -57,6 +58,12 @@ class TestFollowupMeta:
         now = datetime(2026, 9, 30, 12, 0, 0)
         meta = mark_reminded({}, "abc", now=now)
         assert should_send_followup_reminder(meta["abc"], now=now) is False
+
+    def test_clear_entry(self):
+        meta = mark_dismissed({}, "abc")
+        meta = clear_entry(meta, "abc")
+        assert "abc" not in meta
+        assert should_send_followup_reminder(None) is True
 
     def test_follow_up_days(self):
         assert parse_follow_up_days("3") == 3

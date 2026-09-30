@@ -31,18 +31,22 @@ cp .env.example .env
 - **CI** (`.github/workflows/ci.yml`): на push/PR в `develop` и `main` — unit-тесты (`pytest`, без integration).
 - **CD** (`.github/workflows/deploy.yml`): на push в `main` — SSH на prod VM → `git pull` + `scripts/deploy.sh`.
 
-Секреты репозитория (Settings → Secrets → Actions):
+Версия релиза: файл `VERSION` + список изменений `CHANGELOG.md`. В боте `/version`. Health отдаёт `version`. `deploy.sh` тегирует образы `jobhunter-app:X.Y.Z`. Открытые задачи: `docs/TASKS.md`.
 
-| Secret | Пример |
-|--------|--------|
-| `SSH_HOST` | `51.250.104.136` (лучше статичный IP) |
-| `SSH_USER` | `djlazarboy` |
-| `SSH_KEY` | весь private key (файл `djlazarboy`) |
-| `DEPLOY_PATH` | `/opt/job-hunter` (опционально) |
+Секреты репозитория (Settings → Secrets → Actions) — **только в GitHub Secrets, не в git**:
 
-Первый раз на сервере: `bash scripts/server_bootstrap.sh`, заполнить `.env`/`config.yaml`, поставить systemd из `deploy/systemd/`.
+| Secret | Назначение |
+|--------|------------|
+| `SSH_HOST` | IP/hostname prod VM (лучше статичный) |
+| `SSH_USER` | SSH-пользователь на VM |
+| `SSH_KEY` | private key целиком (файл ключа локально, не в репо) |
+| `DEPLOY_PATH` | путь на сервере, по умолчанию `/opt/job-hunter` |
+
+Первый раз на сервере: `bash scripts/server_bootstrap.sh`, заполнить `.env`/`config.yaml` **только на машине**, поднять `docker compose -f docker-compose.prod.yml up -d`.
 
 На prod фильтр PM лучше через DeepSeek (`agents.yaml` → `is_pm_filter.provider: deepseek`), Ollama на 2 GB VM не ставить.
+
+**Не коммитить:** `.env`, `config.yaml`, Telethon `*.session`, `google_credentials.json`, SSH private keys, n8n workflow dumps с токенами.
 
 ---
 

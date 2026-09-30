@@ -59,7 +59,39 @@ CATCHUP_LIMIT = _config["telegram"].get("catchup_limit", 50)
 
 SESSION_FILE = "telethon_session"
 
-client = TelegramClient(WALSession(SESSION_FILE), API_ID, API_HASH)
+
+def _telegram_proxy():
+    """Reuse bot proxy (TELEGRAM_PROXY) so MTProto works from cloud VMs where TG is blocked."""
+    raw = (os.getenv("TELEGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    if not raw:
+        return None
+    from urllib.parse import urlparse
+
+    u = urlparse(raw if "://" in raw else f"http://{raw}")
+    host = u.hostname or "127.0.0.1"
+    port = u.port or 1080
+    scheme = (u.scheme or "http").lower()
+    # Prefer SOCKS5 when scheme is socks*; otherwise HTTP CONNECT (python-socks / PySocks).
+    if scheme.startswith("socks"):
+        ptype = "socks5" if "5" in scheme else "socks4"
+    else:
+        # Host :2080 speaks both HTTP and SOCKS5 — SOCKS5 is more reliable for Telethon.
+        ptype = "socks5"
+    proxy = {
+        "proxy_type": ptype,
+        "addr": host,
+        "port": int(port),
+        "rdns": True,
+    }
+    if u.username:
+        proxy["username"] = u.username
+        proxy["password"] = u.password or ""
+    logger.info(f"Telethon proxy enabled: {ptype}://{host}:{port}")
+    return proxy
+
+
+_proxy = _telegram_proxy()
+client = TelegramClient(WALSession(SESSION_FILE), API_ID, API_HASH, proxy=_proxy)
 
 _active_channels: set[str] = set()
 
@@ -103,7 +135,7 @@ _SPAM_PATTERNS = (
 )
 
 
-async def _process_message(chat_username: str, chat_id: int, msg) -> bool:
+async def _process_message(chat_username: str, chat_id: int, msg, notify: bool = True) -> bool:
     """Save and forward one message. Returns True if it was new."""
     text = msg.text or msg.message or ""
     if not text.strip():
@@ -114,22 +146,34 @@ async def _process_message(chat_username: str, chat_id: int, msg) -> bool:
         logger.debug(f"Skipped spam message {msg.id} from {chat_username}")
         return False
 
+    from tg_post_parse import extract_tg_title, is_digest_post
+
+    if is_digest_post(text):
+        logger.info(f"Skipped digest/compilation message {msg.id} from {chat_username}")
+        return False
+
+    title = extract_tg_title(text)
+
     external_id = f"tg_{chat_id}_{msg.id}"
     if await db.vacancy_exists(external_id):
         return False
 
     url = f"https://t.me/{chat_username}/{msg.id}" if chat_username else ""
-    profile = await db.get_active_profile() or {}
+    profile = {}  # prod: scoring uses per-user profiles in score_server
+    _ = await db.get_active_profile()  # unused
 
     payload = {
         "source": "telegram",
         "channel": f"@{chat_username}" if chat_username else str(chat_id),
         "message_text": text,
+        "title": title,
         "message_id": str(msg.id),
         "date": msg.date.isoformat() if msg.date else "",
         "url": url,
         "external_id": external_id,
         "active_profile": profile,
+        "catchup": (not notify),
+        "notify": bool(notify),
     }
 
     await db.insert_vacancy({
@@ -137,6 +181,7 @@ async def _process_message(chat_username: str, chat_id: int, msg) -> bool:
         "external_id": external_id,
         "channel": payload["channel"],
         "text": text,
+        "title": title,
         "url": url,
         "status": "pending",
     })
@@ -155,7 +200,7 @@ async def _catchup_channel(username: str):
         messages = await client.get_messages(entity, limit=CATCHUP_LIMIT)
         new_count = 0
         for msg in messages:
-            if await _process_message(chat_username, chat_id, msg):
+            if await _process_message(chat_username, chat_id, msg, notify=False):
                 new_count += 1
                 await asyncio.sleep(2)  # не спамить n8n — Ollama занята ~30-60с
 
@@ -166,23 +211,30 @@ async def _catchup_channel(username: str):
         logger.error(f"Catchup ошибка {username}: {e}")
 
 
-async def _subscribe_channel(username: str):
+async def _subscribe_channel(username: str) -> bool:
+    """Subscribe to channel. Returns True if this is a newly added subscription."""
     if username in _active_channels:
-        return
+        return False
     try:
         await client.get_entity(username)
         _active_channels.add(username)
         logger.info(f"Subscribed to {username}")
+        return True
     except (ChannelPrivateError, UsernameNotOccupiedError) as e:
         logger.warning(f"Cannot subscribe to {username}: {e}")
     except Exception as e:
         logger.error(f"Error subscribing to {username}: {e}")
+    return False
 
 
 async def refresh_channels():
+    """Pick up newly added channels and immediately catch up their recent history."""
     channels = await db.get_active_channels()
     for ch in channels:
-        await _subscribe_channel(ch)
+        is_new = await _subscribe_channel(ch)
+        if is_new:
+            logger.info(f"New channel {ch}: catchup last {CATCHUP_LIMIT} messages")
+            await _catchup_channel(ch)
 
 
 @client.on(events.NewMessage())

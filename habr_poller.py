@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import db_postgres as db
+from title_filter import is_junk_title, is_search_keyword
 
 _http_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="n8n-habr")
 
@@ -71,6 +72,8 @@ def _clean_habr_title(title: str) -> str:
 
 def _is_relevant_title(title: str) -> bool:
     clean = _clean_habr_title(title)
+    if is_junk_title(clean):
+        return False
     if _TITLE_WHITELIST.search(clean):
         return True
     if _TITLE_BLACKLIST.search(clean):
@@ -173,6 +176,7 @@ async def poll_habr(progress_callback=None) -> int:
     """Main polling function — returns number of new vacancies."""
     await db.init_db()
     keywords = await db.get_keywords()
+    keywords = [k for k in keywords if is_search_keyword(k)]
     if not keywords:
         logger.info("No keywords configured, skipping habr poll")
         return 0

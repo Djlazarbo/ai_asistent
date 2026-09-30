@@ -8,6 +8,7 @@ import functools
 import os
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 import requests
@@ -19,6 +20,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import db_postgres as db
+
+def _playwright_ready() -> bool:
+    """True if Chromium is available. Safe to call from asyncio loop."""
+    try:
+        def _check() -> bool:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                path = pw.chromium.executable_path
+                return bool(path) and Path(path).exists()
+
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            in_async = True
+        except RuntimeError:
+            in_async = False
+
+        if in_async:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return bool(pool.submit(_check).result(timeout=60))
+        return _check()
+    except Exception as e:
+        logger.warning(f"Playwright unavailable for hh: {e}")
+        return False
+
 
 _http_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="n8n-hh")
 
@@ -60,13 +87,29 @@ async def _new_page(browser: Browser) -> Page:
     return page
 
 
+async def _salary_extra_params() -> str:
+    """Optional &salary=&only_with_salary=true from per-user salary_from setting."""
+    try:
+        raw = await db.get_setting("salary_from")
+        if raw is None:
+            return ""
+        n = int(str(raw).strip().replace(" ", "").replace("\u00a0", ""))
+        if n >= 10000:
+            return f"&salary={n}&only_with_salary=true"
+    except Exception:
+        pass
+    return ""
+
+
 async def _scrape_vacancies(browser: Browser, keyword: str, extra_params: str, date_from: str, max_pages: int = 3) -> list[dict]:
     items = []
+    # Boolean queries (NAME:/OR/NOT) must search all fields via text=; keep name for simple keywords.
+    use_name_field = "NAME:" not in keyword and " OR " not in keyword
     for page_num in range(max_pages):
         url = (
             f"{HH_BASE}/search/vacancy"
             f"?text={quote(keyword)}"
-            f"&search_field=name"
+            f"{'&search_field=name' if use_name_field else ''}"
             f"&order_by=publication_time"
             f"&date_from={date_from}"
             f"&per_page=50"
@@ -173,8 +216,26 @@ async def _retry_pending():
 
 
 async def poll_hh(progress_callback=None):
+    # prod multi-user: keywords via union when no chat context
     await db.init_db()
+
+    if not _playwright_ready():
+        logger.warning("hh.ru пропущен: браузер Playwright недоступен на этом сервере")
+        if progress_callback:
+            try:
+                await progress_callback("hh.ru пропущен (нет Playwright)")
+            except Exception:
+                pass
+        return 0
     keywords = await db.get_keywords()
+    from title_filter import (
+        build_pm_hh_query,
+        is_junk_title,
+        is_search_keyword,
+        user_is_pm_searcher,
+    )
+
+    keywords = [k for k in keywords if is_search_keyword(k)]
     if not keywords:
         logger.info("No keywords configured, skipping hh poll")
         return 0
@@ -190,22 +251,40 @@ async def poll_hh(progress_callback=None):
     logger.info(f"hh poll: ищу за последние {days_back} дн. (с {date_from})")
     seen_ids: set[str] = set()
     new_count = 0
-    total_kw = len(keywords)
 
+    # Moscow (office/any) + remote (any region) + hybrid Moscow.
     search_configs = [
         f"&area={AREA_MOSCOW}&experience=between1And3",
         f"&area={AREA_MOSCOW}&experience=between3And6",
+        f"&area={AREA_MOSCOW}&experience=moreThan6",
         f"&schedule=remote&experience=between1And3",
         f"&schedule=remote&experience=between3And6",
+        f"&schedule=remote&experience=moreThan6",
+        f"&area={AREA_MOSCOW}&work_format=HYBRID&experience=between3And6",
+        f"&area={AREA_MOSCOW}&work_format=HYBRID&experience=moreThan6",
     ]
+    salary_extra = await _salary_extra_params()
+    if salary_extra:
+        search_configs = [c + salary_extra for c in search_configs]
+        logger.info(f"hh poll: salary filter applied {salary_extra}")
+
+    if user_is_pm_searcher(keywords):
+        q = build_pm_hh_query(keywords)
+        queries = [q] if q else list(keywords)
+        logger.info(f"hh poll: PM boolean query ({len(keywords)} keywords → 1 request)")
+    else:
+        queries = list(keywords)
+
+    total_kw = len(queries)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         try:
-            for idx, keyword in enumerate(keywords, 1):
+            for idx, keyword in enumerate(queries, 1):
                 if progress_callback:
+                    label = keyword if len(keyword) < 80 else keyword[:77] + "…"
                     await progress_callback(
-                        f"🔍 [{idx}/{total_kw}] Ищу: {keyword}...\n"
+                        f"🔍 [{idx}/{total_kw}] Ищу: {label}...\n"
                         f"📥 Новых найдено: {new_count}"
                     )
 
@@ -223,6 +302,10 @@ async def poll_hh(progress_callback=None):
                     seen_ids.add(vid)
 
                     if await db.vacancy_exists(vid):
+                        continue
+
+                    if is_junk_title(item.get("title") or ""):
+                        logger.info(f"HH title junk skipped: {item['title']!r}")
                         continue
 
                     description = await _fetch_full_description(browser, item["url"])
@@ -258,7 +341,7 @@ async def poll_hh(progress_callback=None):
                     kw_new += 1
                     logger.info(f"Sent hh vacancy {vid}: {item['title']}")
 
-                logger.info(f"Keyword '{keyword}': {kw_new} new")
+                logger.info(f"Keyword '{keyword[:60]}': {kw_new} new")
         finally:
             await browser.close()
 

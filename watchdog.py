@@ -1,16 +1,16 @@
-"""
+﻿"""
 Watchdog для bot.py — перезапускает бота если он завис или упал.
 Критерии зависания: лог не обновлялся более 5 минут.
 """
 import subprocess
 import sys
 import time
-import os
 from datetime import datetime
 from pathlib import Path
 
-LOG_FILE = Path("D:/Job/job_hunter.log")
-WATCHDOG_LOG = Path("D:/Job/watchdog.log")
+ROOT = Path(__file__).resolve().parent
+LOG_FILE = ROOT / "job_hunter.log"
+WATCHDOG_LOG = ROOT / "watchdog.log"
 CHECK_INTERVAL = 60        # проверять каждые 60 сек
 MAX_SILENCE = 15 * 60      # если лог молчит 15 минут — перезапуск
 RESTART_DELAY = 5          # пауза перед перезапуском
@@ -36,7 +36,7 @@ def start_bot() -> subprocess.Popen:
     wlog("Запускаю bot.py...")
     proc = subprocess.Popen(
         [sys.executable, "bot.py"],
-        cwd="D:/Job",
+        cwd=str(ROOT),
     )
     wlog(f"bot.py запущен, PID={proc.pid}")
     return proc

@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import db_postgres as db
+from title_filter import is_junk_title, is_search_keyword
 
 _http_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="n8n-gm")
 
@@ -74,6 +75,8 @@ _TITLE_BLACKLIST = re.compile(
 
 
 def _is_relevant_title(title: str) -> bool:
+    if is_junk_title(title):
+        return False
     if _TITLE_WHITELIST.search(title):
         return True
     if _TITLE_BLACKLIST.search(title):
@@ -399,6 +402,7 @@ async def poll_getmatch(progress_callback=None) -> int:
     """Main polling function — returns number of new vacancies."""
     await db.init_db()
     keywords = await db.get_keywords()
+    keywords = [k for k in keywords if is_search_keyword(k)]
     if not keywords:
         logger.info("No keywords configured, skipping getmatch poll")
         return 0

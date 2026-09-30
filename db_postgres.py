@@ -158,11 +158,17 @@ async def init_db():
             )
     
     try:
+        import user_data
+        async with pool.acquire() as conn:
+            await user_data.ensure_user_data_schema(conn)
+    except Exception as e:
+        logger.warning(f"user_data schema init skipped: {e}")
+
+    try:
         import multiuser
         import user_data
         async with pool.acquire() as conn:
             await multiuser.ensure_multiuser_schema(conn)
-            await user_data.ensure_user_data_schema(conn)
             await multiuser.seed_invite_codes(conn)
             admin_id = int(_config.get("telegram_bot", {}).get("chat_id") or 0)
             if admin_id:
@@ -171,7 +177,7 @@ async def init_db():
                     return row["value"] if row else None
                 await user_data.migrate_admin_from_global(conn, admin_id, _gset)
     except Exception as e:
-        logger.warning(f"multiuser/user_data init skipped: {e}")
+        logger.warning(f"multiuser init skipped: {e}")
 
     logger.info("PostgreSQL initialized")
 
@@ -735,19 +741,21 @@ async def cleanup_old_vacancies(days: int = 30) -> int:
     pool = await _get_pool()
     deleted_uv = deleted_legacy = deleted_pool = 0
     async with pool.acquire() as conn:
-        uv_res = await conn.execute(
-            """
-            DELETE FROM user_vacancies
-            WHERE created_at < $1
-              AND COALESCE(is_favorite, FALSE) = FALSE
-              AND status = ANY($2::text[])
-              AND status <> ALL($3::text[])
-            """,
-            cutoff,
-            list(_purge),
-            list(_keep),
-        )
-        deleted_uv = int(uv_res.split()[-1])
+        has_uv = await conn.fetchval("SELECT to_regclass('public.user_vacancies')")
+        if has_uv:
+            uv_res = await conn.execute(
+                """
+                DELETE FROM user_vacancies
+                WHERE created_at < $1
+                  AND COALESCE(is_favorite, FALSE) = FALSE
+                  AND status = ANY($2::text[])
+                  AND status <> ALL($3::text[])
+                """,
+                cutoff,
+                list(_purge),
+                list(_keep),
+            )
+            deleted_uv = int(uv_res.split()[-1])
 
         leg_res = await conn.execute(
             "DELETE FROM vacancies WHERE status IN ('pending', 'skipped', 'filtered') "
@@ -756,17 +764,25 @@ async def cleanup_old_vacancies(days: int = 30) -> int:
         )
         deleted_legacy = int(leg_res.split()[-1])
 
-        pool_res = await conn.execute(
-            """
-            DELETE FROM vacancies_pool vp
-            WHERE vp.created_at < $1
-              AND NOT EXISTS (
-                SELECT 1 FROM user_vacancies uv WHERE uv.vacancy_id = vp.id
-              )
-            """,
-            cutoff,
-        )
-        deleted_pool = int(pool_res.split()[-1])
+        has_pool = await conn.fetchval("SELECT to_regclass('public.vacancies_pool')")
+        if has_pool and has_uv:
+            pool_res = await conn.execute(
+                """
+                DELETE FROM vacancies_pool vp
+                WHERE vp.created_at < $1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM user_vacancies uv WHERE uv.vacancy_id = vp.id
+                  )
+                """,
+                cutoff,
+            )
+            deleted_pool = int(pool_res.split()[-1])
+        elif has_pool:
+            pool_res = await conn.execute(
+                "DELETE FROM vacancies_pool WHERE created_at < $1",
+                cutoff,
+            )
+            deleted_pool = int(pool_res.split()[-1])
 
     deleted = deleted_uv + deleted_legacy + deleted_pool
     logger.info(

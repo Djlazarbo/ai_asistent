@@ -400,6 +400,18 @@ async def _scrape_keyword(keyword: str, location: str) -> list[dict]:
 
 async def poll_getmatch(progress_callback=None) -> int:
     """Main polling function — returns number of new vacancies."""
+    import os
+
+    if (os.getenv("GETMATCH_ENABLED") or "0").strip().lower() not in ("1", "true", "yes", "on"):
+        from loguru import logger as _lg
+
+        _lg.info("Getmatch disabled via GETMATCH_ENABLED")
+        if progress_callback:
+            try:
+                await progress_callback("Getmatch выключен (GETMATCH_ENABLED=0)")
+            except Exception:
+                pass
+        return 0
     await db.init_db()
     keywords = await db.get_keywords()
     keywords = [k for k in keywords if is_search_keyword(k)]
@@ -414,9 +426,10 @@ async def poll_getmatch(progress_callback=None) -> int:
 
     for idx, keyword in enumerate(keywords, 1):
         if progress_callback:
+            short = keyword if len(keyword) < 40 else keyword[:37] + "…"
             await progress_callback(
-                f"🔍 [{idx}/{total_kw}] Getmatch: {keyword}...\n"
-                f"📥 Новых найдено: {new_count}"
+                f"Getmatch: {idx}/{total_kw} — «{short}»\n"
+                f"Новых пока: {new_count}"
             )
 
         kw_new = 0

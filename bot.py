@@ -98,6 +98,23 @@ def _followup_text(title: str) -> str:
     )
 
 
+def _search_progress_text(raw: str) -> str:
+    """One leading 🔍; strip duplicates from poller notes."""
+    t = (raw or "").strip()
+    if not t:
+        return "🔍 Идёт поиск…"
+    while t.startswith("🔍"):
+        t = t[1:].lstrip()
+    return "🔍 " + t
+
+
+async def _edit_search_progress(msg, raw: str) -> None:
+    try:
+        await msg.edit_text(_search_progress_text(raw))
+    except Exception:
+        pass
+
+
 def _is_followup_reminder_message(query) -> bool:
     """True for push reminder cards; False for main menu / other UIs."""
     try:
@@ -1427,13 +1444,10 @@ async def _run_searchnow(msg, progress_callback=None):
 @owner_only
 async def cmd_searchnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    msg = await update.effective_message.reply_text("🔍 Запускаю поиск hh.ru + Хабр + Getmatch...")
+    msg = await update.effective_message.reply_text("🔍 Запускаю поиск hh.ru + Хабр…")
 
     async def progress(t: str):
-        try:
-            await msg.edit_text(f"🔍 {t}")
-        except Exception:
-            pass
+        await _edit_search_progress(msg, t)
 
     try:
         text_out, _ok = await _execute_search_now(chat.id if chat else None, progress_callback=progress)
@@ -1446,6 +1460,26 @@ async def cmd_searchnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+@owner_only
+async def cmd_cancelsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel in-flight /searchnow on the Playwright poller."""
+    import os
+    import httpx
+
+    chat = update.effective_chat
+    if not chat:
+        return
+    base = (os.getenv("POLLER_URL") or "http://poller:5680").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(base + "/cancel", json={"chat_id": int(chat.id)})
+            data = r.json() if r.status_code < 500 else {}
+            text = (data.get("text") or "").strip() or f"HTTP {r.status_code}"
+            await update.effective_message.reply_text("⏹ " + text if not text.startswith("⏹") else text)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Не удалось отменить поиск: {e}")
 
 
 @owner_only
@@ -1572,7 +1606,13 @@ def _is_relevant(v: dict, kw_lower: list[str]) -> bool:
 
 @owner_only
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _show_vacancy_page(context.bot, update.effective_chat.id, 0, context)
+    _cid = update.effective_chat.id if update.effective_chat else None
+    _tok = db.set_request_chat_id(_cid) if _cid else None
+    try:
+        await _show_vacancy_page(context.bot, update.effective_chat.id, 0, context)
+    finally:
+        if _tok is not None:
+            db.reset_request_chat_id(_tok)
 
 
 @owner_only
@@ -1971,6 +2011,19 @@ async def _filter_is_deepseek() -> bool:
     return cfg.get("provider") == "deepseek"
 
 
+def _channel_from_vacancy(v: dict) -> str:
+    """Prefer stored channel; else recover @username from t.me URL."""
+    ch = (v.get("channel") or "").strip()
+    if ch and ch.lower() not in ("telegram", "tg", "channels", "hh", "hh.ru", "habr", "getmatch", "unknown"):
+        return ch if ch.startswith("@") or ch.lstrip("-").isdigit() else f"@{ch}"
+    url = (v.get("url") or "").strip()
+    # https://t.me/projects_jobs/151222 or https://t.me/c/123/456
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z0-9_]+)/\d+", url)
+    if m and m.group(1).lower() not in ("c", "s"):
+        return f"@{m.group(1)}"
+    return ch
+
+
 async def _send_one_and_wait(v: dict, profile: dict) -> bool:
     """Send one vacancy to n8n.
     DeepSeek: polls DB every 5s until status leaves 'pending' (fast pipeline).
@@ -1978,6 +2031,8 @@ async def _send_one_and_wait(v: dict, profile: dict) -> bool:
     """
     ext = v["external_id"]
     text = v.get("text", "")
+    chat_id = v.get("chat_id")
+    channel = _channel_from_vacancy(v)
     payload = {
         "source": v.get("source", ""),
         "id": ext,
@@ -1986,50 +2041,103 @@ async def _send_one_and_wait(v: dict, profile: dict) -> bool:
         "company": v.get("company", ""),
         "salary": v.get("salary", ""),
         "url": v.get("url", ""),
+        "channel": channel,
         "description": text,
         "message_text": text,
         "active_profile": profile,
     }
+    # Multi-user: bind request chat so status polls hit user_vacancies, not legacy table.
+    _tok = db.set_request_chat_id(int(chat_id)) if chat_id else None
     try:
-        await hh_poller._send_to_n8n(payload)
-    except Exception as e:
-        logger.error(f"retry_scoring send error for {ext}: {e}")
+        try:
+            await hh_poller._send_to_n8n(payload)
+        except Exception as e:
+            logger.error(f"retry_scoring send error for {ext}: {e}")
+            return False
+
+        if await _filter_is_deepseek():
+            # DeepSeek is fast — poll until n8n finishes, then move on immediately
+            for _ in range(_SCORE_TIMEOUT // 5):
+                await asyncio.sleep(5)
+                current = await db.get_vacancy_by_external(ext)
+                if current and current.get("status") != "pending":
+                    return True
+            logger.warning(f"retry_scoring timeout waiting for {ext}")
+            # Don't spin forever on poison pills: leave pending for next cycle but advance.
+            return False
+        else:
+            # Ollama is slow — just give it 30s and move on (old behaviour)
+            await asyncio.sleep(30)
+
+        return True
+    finally:
+        if _tok is not None:
+            db.reset_request_chat_id(_tok)
+
+
+async def _pending_all_users() -> list:
+    """Pending queue for ALL users. Clears the request-chat scope so a manual
+    /drainpending or /retryscoring (which run inside the caller's token) does
+    not silently see only the caller's rows while the scheduled job sees all."""
+    import user_data as _ud
+
+    tok = _ud.set_request_chat_id(None)
+    try:
+        return await db.get_pending_vacancies()
+    finally:
+        _ud.reset_request_chat_id(tok)
+
+
+async def _drain_skip_stuck(v: dict, cid) -> bool:
+    """Mark a permanently-stuck pending vacancy as skipped (poison pill)."""
+    if not cid:
         return False
-
-    if await _filter_is_deepseek():
-        # DeepSeek is fast — poll until n8n finishes, then move on immediately
-        for _ in range(_SCORE_TIMEOUT // 5):
-            await asyncio.sleep(5)
-            current = await db.get_vacancy_by_external(ext)
-            if current and current.get("status") != "pending":
-                return True
-        logger.warning(f"retry_scoring timeout waiting for {ext}")
-    else:
-        # Ollama is slow — just give it 30s and move on (old behaviour)
-        await asyncio.sleep(30)
-
-    return True
+    try:
+        tok = db.set_request_chat_id(int(cid))
+        try:
+            await db.update_vacancy_status(v["external_id"], "skipped")
+            logger.warning(f"drain skipped stuck pending {v['external_id']} chat={cid}")
+            return True
+        finally:
+            db.reset_request_chat_id(tok)
+    except Exception as e:
+        logger.error(f"drain skip failed {v.get('external_id')}: {e}")
+        return False
 
 
 async def _do_retry_scoring(batch: int = _SCORE_BATCH) -> dict:
     """Send up to `batch` pending vacancies to n8n, one at a time."""
-    pending = await db.get_pending_vacancies()
+    pending = await _pending_all_users()
     if not pending:
         return {"total": 0, "sent": 0}
     if batch > 0:
         pending = pending[:batch]
-    profile = await db.get_active_profile() or {}
     sent = 0
     for v in pending:
-        if await _send_one_and_wait(v, profile):
-            sent += 1
+        cid = v.get("chat_id")
+        _tok = db.set_request_chat_id(int(cid)) if cid else None
+        try:
+            try:
+                profile = await db.get_active_profile() or {}
+            except Exception as e:
+                logger.error(f"retry_scoring profile fetch failed: {e}")
+                profile = {}
+            if await _send_one_and_wait(v, profile):
+                sent += 1
+        finally:
+            if _tok is not None:
+                db.reset_request_chat_id(_tok)
     logger.info(f"retry_scoring: sent {sent}/{len(pending)} pending vacancies to n8n")
     return {"total": len(pending), "sent": sent}
 
 
 @owner_only
 async def cmd_retryscoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pending = await db.get_pending_vacancies()
+    global _drain_task
+    if _drain_task and not _drain_task.done():
+        await update.message.reply_text("⚠️ Drain уже запущен. Подожди завершения.")
+        return
+    pending = await _pending_all_users()
     if not pending:
         await update.message.reply_text("✅ Нет вакансий в очереди — всё обработано.")
         return
@@ -2058,7 +2166,7 @@ async def cmd_drainpending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Drain уже запущен. Подожди завершения.")
         return
 
-    pending = await db.get_pending_vacancies()
+    pending = await _pending_all_users()
     if not pending:
         await update.message.reply_text("✅ Очередь пуста — нечего обрабатывать.")
         return
@@ -2073,16 +2181,46 @@ async def cmd_drainpending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     async def _drain():
-        profile = await db.get_active_profile() or {}
         sent_total = 0
+        fail_streak = 0
+        stuck_ext = None
+        stuck_count = 0
         while True:
-            pending = await db.get_pending_vacancies()
+            pending = await _pending_all_users()
             if not pending:
                 break
             v = pending[0]
-            await _send_one_and_wait(v, profile)
-            sent_total += 1
-            remaining = len(await db.get_pending_vacancies())
+            ext = v.get("external_id")
+            # Hard stop: same head vacancy after retries — DB skip failed too.
+            stuck_count = stuck_count + 1 if ext == stuck_ext else 1
+            stuck_ext = ext
+            if stuck_count >= 3:
+                logger.error(f"drain abort: {ext} still pending after retries")
+                break
+            cid = v.get("chat_id")
+            _tok = db.set_request_chat_id(int(cid)) if cid else None
+            ok = False
+            try:
+                try:
+                    profile = await db.get_active_profile() or {}
+                except Exception as e:
+                    logger.error(f"drain profile fetch failed: {e}")
+                    profile = {}
+                ok = await _send_one_and_wait(v, profile)
+            except Exception as e:
+                logger.error(f"drain send failed {ext}: {e}")
+            finally:
+                if _tok is not None:
+                    db.reset_request_chat_id(_tok)
+            if ok:
+                sent_total += 1
+                fail_streak = 0
+            else:
+                fail_streak += 1
+                # Poison pill: skip so the drain can progress past it.
+                if fail_streak >= 2 and await _drain_skip_stuck(v, cid):
+                    fail_streak = 0
+            remaining = len(await _pending_all_users())
             if sent_total % _SCORE_BATCH == 0:
                 try:
                     await context.bot.send_message(
@@ -2120,14 +2258,45 @@ async def retry_scoring_job(context: ContextTypes.DEFAULT_TYPE):
         if await _filter_is_deepseek():
             # DeepSeek: kick off a silent drain — no per-batch Telegram noise
             async def _silent_drain():
-                profile = await db.get_active_profile() or {}
                 sent_total = 0
+                fail_streak = 0
+                stuck_ext = None
+                stuck_count = 0
                 while True:
                     pending = await db.get_pending_vacancies()
                     if not pending:
                         break
-                    await _send_one_and_wait(pending[0], profile)
+                    v = pending[0]
+                    ext = v.get("external_id")
+                    # Hard stop: same head vacancy after retries — DB skip failed too.
+                    stuck_count = stuck_count + 1 if ext == stuck_ext else 1
+                    stuck_ext = ext
+                    if stuck_count >= 3:
+                        logger.error(f"silent_drain abort: {ext} still pending after retries")
+                        break
+                    cid = v.get("chat_id")
+                    _tok = db.set_request_chat_id(int(cid)) if cid else None
+                    ok = False
+                    try:
+                        try:
+                            profile = await db.get_active_profile() or {}
+                        except Exception as e:
+                            logger.error(f"silent_drain profile fetch failed: {e}")
+                            profile = {}
+                        ok = await _send_one_and_wait(v, profile)
+                    except Exception as e:
+                        logger.error(f"silent_drain send failed {ext}: {e}")
+                    finally:
+                        if _tok is not None:
+                            db.reset_request_chat_id(_tok)
                     sent_total += 1
+                    if ok:
+                        fail_streak = 0
+                    else:
+                        fail_streak += 1
+                        # Poison pill / permanent timeout: skip so drain can progress.
+                        if fail_streak >= 2 and await _drain_skip_stuck(v, cid):
+                            fail_streak = 0
                 logger.info(f"silent_drain finished: {sent_total} vacancies processed")
 
             _drain_task = asyncio.create_task(_silent_drain())
@@ -2197,10 +2366,7 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         async def progress(t: str):
-            try:
-                await msg.edit_text(f"🔍 {t}")
-            except Exception:
-                pass
+            await _edit_search_progress(msg, t)
 
         try:
             text_out, _ok = await _execute_search_now(chat_id, progress_callback=progress)
@@ -2498,7 +2664,7 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "🔍 Ключевых слов пока нет."
         text += (
             chr(10) + chr(10)
-            + "Слова подтягиваются из резюме при сохранении профиля."
+            + "Из резюме берём только роль/должность, не навыки."
             + chr(10) + "Можно добавить свои и удалить лишние."
             + chr(10) + chr(10) + "➕ Добавить:" + chr(10) + "/addkeyword ваша фраза"
             + chr(10) + chr(10) + "➖ Удалить: кнопка ниже или" + chr(10) + "/removekeyword фраза"
@@ -2522,7 +2688,7 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "🔍 Ключевых слов пока нет."
         text += (
             chr(10) + chr(10)
-            + "Слова подтягиваются из резюме при сохранении профиля."
+            + "Из резюме берём только роль/должность, не навыки."
             + chr(10) + "Можно добавить свои и удалить лишние."
             + chr(10) + chr(10) + "➕ Добавить:" + chr(10) + "/addkeyword ваша фраза"
             + chr(10) + chr(10) + "➖ Удалить: кнопка ниже или" + chr(10) + "/removekeyword фраза"
@@ -3216,18 +3382,14 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             if hasattr(db, "merge_keywords_from_profile"):
                 kw_added = await db.merge_keywords_from_profile(profile) or []
             else:
-                for kw in (profile.get("role"),):
+                for field in ("target_role", "desired_role", "role", "position", "current_title"):
+                    kw = profile.get(field)
                     if isinstance(kw, str) and kw.strip():
-                        await db.add_keyword(kw.strip())
-                        kw_added.append(kw.strip())
-                for field in ("key_skills", "tech_stack", "domains"):
-                    for kw in (profile.get(field) or [])[:8]:
-                        s = str(kw).strip()
-                        if s:
-                            before = await db.get_keywords()
-                            await db.add_keyword(s)
-                            if not any(b.lower() == s.lower() for b in before):
-                                kw_added.append(s)
+                        s = kw.strip()
+                        before = await db.get_keywords()
+                        await db.add_keyword(s)
+                        if not any(b.lower() == s.lower() for b in before):
+                            kw_added.append(s)
         except Exception as e:
             logger.warning(f"keywords from resume: {e}")
         # Do not spam until search is configured.
@@ -3241,9 +3403,9 @@ async def _handle_callback_body(update: Update, context: ContextTypes.DEFAULT_TY
             more = f" (+{len(kw_added) - 8})" if len(kw_added) > 8 else ""
             kw_line = (
                 chr(10) + chr(10)
-                + "🔍 Из резюме добавлены слова:" + chr(10)
+                + "🔍 Из резюме добавлены роли (не навыки):" + chr(10)
                 + shown + more + chr(10)
-                + "Можно дописать вручную: /addkeyword фраза"
+                + "Дописать вручную: /addkeyword IT project manager"
             )
         await query.edit_message_text(
             "✅ Резюме сохранено — шаг 1/3" + chr(10) + chr(10)
@@ -3648,10 +3810,7 @@ async def _wrapped_handle_message(update, context):
         msg = await update.message.reply_text("🔍 Запускаю поиск hh.ru + Хабр + Getmatch...")
 
         async def progress(t: str):
-            try:
-                await msg.edit_text(f"🔍 {t}")
-            except Exception:
-                pass
+            await _edit_search_progress(msg, t)
 
         try:
             text_out, _ok = await _execute_search_now(update.effective_chat.id, progress_callback=progress)
@@ -3774,7 +3933,15 @@ async def cmd_menu_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _show_vacancy_page(context.bot, update.effective_chat.id, 0, context, source="all")
+    # Scope to the caller's feed — without the token this fell back to the
+    # legacy global table and leaked it to unregistered chats.
+    _cid = update.effective_chat.id if update.effective_chat else None
+    _tok = db.set_request_chat_id(_cid) if _cid else None
+    try:
+        await _show_vacancy_page(context.bot, update.effective_chat.id, 0, context, source="all")
+    finally:
+        if _tok is not None:
+            db.reset_request_chat_id(_tok)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3938,6 +4105,8 @@ def main():
     app.add_handler(CommandHandler("addkeyword", cmd_addkeyword))
     app.add_handler(CommandHandler("removekeyword", cmd_removekeyword))
     app.add_handler(CommandHandler("searchnow", cmd_searchnow))
+    app.add_handler(CommandHandler("cancelsearch", cmd_cancelsearch))
+    app.add_handler(CommandHandler("cancel", cmd_cancelsearch))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("v", cmd_vacancy))
     app.add_handler(CommandHandler("vacancy", cmd_vacancy))
@@ -4167,6 +4336,12 @@ def _format_search_result(text_out: str) -> str:
     return t
 
 
+# Local cooldown for the light fallback: without it every /searchnow click ran
+# a full HH API collect when the poller was down (poller 429 covers only itself).
+_LIGHT_SEARCH_COOLDOWN_SEC = int(os.getenv("LIGHT_SEARCH_COOLDOWN_SEC") or "3600")
+_light_search_last_ts: dict[int, float] = {}
+
+
 async def _execute_search_now(chat_id: int | None, progress_callback=None) -> tuple[str, bool]:
     """Prod search via Playwright poller only; never Chromium in slim bot."""
     from loguru import logger as _lg
@@ -4180,10 +4355,22 @@ async def _execute_search_now(chat_id: int | None, progress_callback=None) -> tu
         return note, True
 
     low = (note or "").lower()
-    if "уже выполняется" in low or "already running" in low or "подождите" in low:
+    # 409 notes: "Поиск в очереди/выполняется: …" / "Поиск ещё в очереди…".
+    # These mean the user's search is already queued — never fall through to
+    # the light fallback on top of it.
+    if any(s in low for s in ("уже выполняется", "already running", "подождите", "в очереди", "выполняется")):
         return note, True
 
-    _lg.warning("poller search failed: %s", note)
+    _lg.warning(f"poller search failed: {note}")
+    _cid_key = int(chat_id or 0)
+    _now = time.time()
+    if _now - (_light_search_last_ts.get(_cid_key) or 0) < _LIGHT_SEARCH_COOLDOWN_SEC:
+        return (
+            "⏳ Лёгкий поиск можно запускать не чаще 1 раза в час. "
+            f"Poller: {note}",
+            False,
+        )
+    _light_search_last_ts[_cid_key] = _now
     if progress_callback:
         try:
             await progress_callback("⚠️ Poller недоступен, запасной лёгкий поиск…")
@@ -4310,54 +4497,63 @@ async def _search_now_light(chat_id: int) -> tuple[int, str]:
     from light_hh import collect_light, parse_keywords
     import db_postgres as db
 
-    keywords = []
+    tok = db.set_request_chat_id(int(chat_id)) if chat_id else None
     try:
-        if hasattr(db, "get_setting"):
-            raw = await db.get_setting("hh_keywords", chat_id=chat_id)
-            keywords = parse_keywords(raw if isinstance(raw, str) else str(raw or ""))
-        elif hasattr(db, "get_user_setting"):
-            raw = await db.get_user_setting(chat_id, "hh_keywords")
-            keywords = parse_keywords(str(raw or ""))
-    except Exception:
         keywords = []
-
-    if not keywords:
-        return 0, (
-            "У вас не заданы ключевые слова поиска.\n"
-            "Добавьте свои keywords в настройках — у каждого пользователя свой список."
-        )
-
-    vacs = await collect_light(keywords, include_habr=True)
-    saved = 0
-    for v in vacs:
         try:
-            if hasattr(db, "upsert_vacancy_pool"):
-                await db.upsert_vacancy_pool(v)
-                saved += 1
-            elif hasattr(db, "add_vacancy"):
-                await db.add_vacancy(v)
-                saved += 1
+            raw = await db.get_setting("hh_keywords")
+            keywords = parse_keywords(raw if isinstance(raw, str) else str(raw or ""))
         except Exception:
-            pass
+            keywords = []
 
-    # Trigger scoring webhook if available
-    try:
-        import os, httpx
-        score_url = os.getenv("SCORE_WEBHOOK_URL", "http://score:8080/vacancy")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for v in vacs[:30]:
-                try:
-                    await client.post(score_url, json=v)
-                except Exception:
-                    break
-    except Exception:
-        pass
+        if not keywords:
+            return 0, (
+                "У вас не заданы ключевые слова поиска.\n"
+                "Добавьте свои keywords в настройках — у каждого пользователя свой список."
+            )
 
-    note = (
-        f"Найдено {len(vacs)} (HH/Habr, без браузера). "
-        f"В пул: {saved}. Источники Playwright пропущены (нет Chromium в bot-образе)."
-    )
-    return len(vacs), note
+        vacs = await collect_light(keywords, include_habr=True)
+        saved = 0
+        for v in vacs:
+            try:
+                payload = {
+                    "source": v.get("source") or "hh",
+                    "external_id": str(v.get("external_id") or v.get("id") or ""),
+                    "title": v.get("title") or "",
+                    "company": v.get("company") or "",
+                    "salary": v.get("salary") or "",
+                    "url": v.get("url") or "",
+                    "text": v.get("description") or v.get("text") or "",
+                    "channel": v.get("channel") or v.get("source") or "hh",
+                    "status": "pending",
+                }
+                if not payload["external_id"]:
+                    continue
+                if await db.vacancy_exists(payload["external_id"]):
+                    continue
+                await db.insert_vacancy(payload)
+                saved += 1
+            except Exception:
+                pass
+
+        backfilled = 0
+        try:
+            from user_feed_backfill import backfill_user_feed
+            bf = await backfill_user_feed(int(chat_id), days=7, limit=40, notify=False)
+            backfilled = int(bf.get("ok") or 0)
+        except Exception as e:
+            logger.warning(f"light backfill chat={chat_id}: {e}")
+
+        note = (
+            f"Найдено {len(vacs)} (HH/Habr, без браузера). "
+            f"Новых в пул: {saved}."
+        )
+        if backfilled:
+            note += f" Из базы к вашей ленте: +{backfilled}."
+        return len(vacs) + backfilled, note
+    finally:
+        if tok is not None:
+            db.reset_request_chat_id(tok)
 
 if __name__ == "__main__":
     main()

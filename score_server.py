@@ -188,7 +188,17 @@ async def handle_vacancy_webhook(request: web.Request) -> web.Response:
     salary = data.get("salary") or ""
     source = data.get("source") or "unknown"
     url = data.get("url") or ""
-    channel = data.get("channel") or source
+    channel = (data.get("channel") or "").strip()
+    # Never fall back to source name ("telegram"/"hh") — that breaks TG ownership checks
+    # and overwrites a good @channel on retry. Recover from t.me URL when missing.
+    _src_like = {"", "telegram", "tg", "channels", "hh", "hh.ru", "habr", "getmatch", "unknown"}
+    if channel.lower() in _src_like:
+        import re as _re
+        m = _re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z0-9_]+)/\d+", url or "")
+        if m and m.group(1).lower() not in ("c", "s"):
+            channel = f"@{m.group(1)}"
+        else:
+            channel = ""
     salary_str = salary if isinstance(salary, str) else json.dumps(salary, ensure_ascii=False)
 
     if not external_id:
@@ -265,7 +275,15 @@ async def handle_vacancy_webhook(request: web.Request) -> web.Response:
         )
 
     # Multi-user fan-out (only ready users; source-scoped)
-    chat_ids = await db.list_active_users_for_scoring()
+    only_chat = data.get("only_chat_id") or data.get("chat_id_only")
+    try:
+        only_chat_i = int(only_chat) if only_chat not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        only_chat_i = None
+    if only_chat_i is not None:
+        chat_ids = [only_chat_i]
+    else:
+        chat_ids = await db.list_active_users_for_scoring()
     if _sfo is not None:
         if hasattr(_sfo, "filter_chats_for_vacancy"):
             chat_ids = await _sfo.filter_chats_for_vacancy(
@@ -292,6 +310,24 @@ async def handle_vacancy_webhook(request: web.Request) -> web.Response:
         logging.info(
             f"webhook: LLM is_pm=NO {external_id} title={title[:70]!r} — fan-out by keywords"
         )
+
+    # No eligible users → clear orphan pending rows so retry_scoring does not spin forever.
+    if not chat_ids:
+        try:
+            pool = await db._get_pool()
+            async with pool.acquire() as conn:
+                cleared = await conn.execute(
+                    """
+                    UPDATE user_vacancies
+                    SET status='skipped', updated_at=NOW()
+                    WHERE vacancy_id=$1 AND status='pending' AND personal_score IS NULL
+                    """,
+                    str(external_id),
+                )
+            logging.info(f"webhook fanout {external_id}: no eligible chats, cleared {cleared}")
+        except Exception as e:
+            logging.warning(f"webhook clear orphan pending {external_id}: {e}")
+        return web.json_response({"ok": True, "is_pm": bool(is_pm), "users": []})
 
     score_llm = 0
     score_skip_cached = 0
@@ -393,16 +429,16 @@ async def handle_vacancy_webhook(request: web.Request) -> web.Response:
             )
             if vac_card.get("_skipped_archived"):
                 try:
-                    await db.update_vacancy_status_for_chat(cid, external_id, "skipped_archived")
-                except Exception:
-                    try:
+                    if hasattr(db, "update_vacancy_status_for_chat"):
+                        await db.update_vacancy_status_for_chat(cid, external_id, "skipped_archived")
+                    else:
                         tok = db.set_request_chat_id(int(cid))
                         try:
                             await db.update_vacancy_status(external_id, "skipped_archived")
                         finally:
                             db.reset_request_chat_id(tok)
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
     logging.info(
         f"webhook fanout {external_id} score_llm={score_llm} score_skip_cached={score_skip_cached}"

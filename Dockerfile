@@ -15,8 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY agents.py agents.yaml agents.prod.yaml ai.py bot.py \
      db_postgres.py db.py prompts.py score_server.py sheets.py \
      telethon_monitor.py watchdog.py hh_poller.py habr_poller.py \
-     getmatch_poller.py retry_pending.py run_bot.py \
-     title_filter.py score_fanout_opt.py user_data.py \
+     getmatch_poller.py retry_pending.py run_bot.py light_hh.py \
+     title_filter.py score_fanout_opt.py user_data.py multiuser.py \
+     user_feed_backfill.py tg_notify.py \
      followup_meta.py tg_post_parse.py version.py VERSION CHANGELOG.md ./
 
 ARG APP_VERSION=dev

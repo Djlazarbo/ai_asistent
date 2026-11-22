@@ -1,5 +1,5 @@
 # Poller image: Playwright Chromium for hh.ru scraping.
-FROM mcr.microsoft.com/playwright/python:v1.49.1-jammy
+FROM mcr.microsoft.com/playwright/python:v1.64.1-jammy
 
 WORKDIR /app
 
@@ -8,9 +8,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agents.py agents.yaml agents.prod.yaml ai.py \
     db_postgres.py prompts.py sheets.py \
-    hh_poller.py habr_poller.py getmatch_poller.py \
-    title_filter.py user_data.py followup_meta.py \
+    hh_poller.py habr_poller.py getmatch_poller.py light_hh.py \
+    title_filter.py score_fanout_opt.py user_data.py multiuser.py \
+    user_feed_backfill.py followup_meta.py tg_notify.py \
     version.py VERSION CHANGELOG.md ./
+# tg_notify is only needed by score_server, but keep the module sets identical
+# so poller scripts can never die on a missing import after a hotfix copy.
 
 ARG APP_VERSION=dev
 ARG APP_GIT_SHA=

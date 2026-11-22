@@ -349,7 +349,12 @@ async def upsert_pool_vacancy(conn, data: dict) -> str:
           salary = COALESCE(EXCLUDED.salary, vacancies_pool.salary),
           url = COALESCE(EXCLUDED.url, vacancies_pool.url),
           text = COALESCE(EXCLUDED.text, vacancies_pool.text),
-          channel = COALESCE(EXCLUDED.channel, vacancies_pool.channel)
+          channel = CASE
+            WHEN EXCLUDED.channel IS NULL OR btrim(EXCLUDED.channel) = '' THEN vacancies_pool.channel
+            WHEN lower(EXCLUDED.channel) IN ('telegram','tg','channels','hh','hh.ru','habr','getmatch','unknown')
+              THEN COALESCE(vacancies_pool.channel, EXCLUDED.channel)
+            ELSE EXCLUDED.channel
+          END
         """,
         eid,
         data.get("source") or "unknown",

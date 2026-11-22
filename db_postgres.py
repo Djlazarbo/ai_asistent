@@ -1396,13 +1396,16 @@ async def get_threshold_for_chat(chat_id: int) -> int:
 async def is_monitoring_for_chat(chat_id: int) -> bool:
     import user_data
     val = await _conn_call(user_data.get_user_setting, chat_id, "monitoring_active")
-    return (val or "false") == "true"
+    # Align with is_monitoring_active(): missing setting means ON.
+    # (Previously defaulted to false → other users never got scored.)
+    return (val or "true") == "true"
 
 
 async def is_notify_new_for_chat(chat_id: int) -> bool:
     import user_data
     val = await _conn_call(user_data.get_user_setting, chat_id, "notify_new")
-    return (val or "false") == "true"
+    # New users opt into pushes by default once search-ready.
+    return (val or "true") == "true"
 
 # === OPENFIX_MU_OVERRIDES ===
 async def mark_viewed(external_id: str):
@@ -1434,8 +1437,13 @@ async def count_favorites() -> int:
     return await _orig_count_favorites()
 
 
-async def save_cover_example(external_id: str, text: str, status: str = "worked"):
-    cid = _cid()
+# Optional explicit chat_id wins over request context (handle_message passes it
+# directly). A second duplicate block used to shadow these with chat-blind
+# versions (cross-user leaks of interview notes / cover letters) — removed.
+async def save_cover_example(
+    external_id: str, text: str, status: str = "worked", chat_id: int | None = None
+):
+    cid = int(chat_id) if chat_id is not None else _cid()
     if _mu():
         if cid is None:
             raise RuntimeError("save_cover_example requires chat_id in multi-user mode")
@@ -1445,8 +1453,8 @@ async def save_cover_example(external_id: str, text: str, status: str = "worked"
     await _orig_save_cover_example(external_id, text, status)
 
 
-async def get_cover_examples(limit: int = 5) -> str:
-    cid = _cid()
+async def get_cover_examples(limit: int = 5, chat_id: int | None = None) -> str:
+    cid = int(chat_id) if chat_id is not None else _cid()
     if _mu():
         if cid is None:
             raise RuntimeError("get_cover_examples requires chat_id in multi-user mode")
@@ -1455,165 +1463,28 @@ async def get_cover_examples(limit: int = 5) -> str:
     return await _orig_get_cover_examples(limit)
 
 
-async def save_interview(company: str, vacancy_id: str, notes: str, questions_list: list = None):
-    cid = _cid()
+async def save_interview(
+    company: str, vacancy_id: str, notes: str, questions_list: list = None,
+    chat_id: int | None = None,
+):
+    cid = int(chat_id) if chat_id is not None else _cid()
     if _mu():
         if cid is None:
             raise RuntimeError("save_interview requires chat_id in multi-user mode")
         import user_data
         await _conn_call(user_data.save_user_interview, cid, company, vacancy_id, notes, questions_list)
         return
-    now = datetime.utcnow()
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO interview_history (company, vacancy_id, notes, questions, created_at) VALUES ("
-            + D + "1, " + D + "2, " + D + "3, " + D + "4::jsonb, " + D + "5)",
-            company, vacancy_id, notes, json.dumps(questions_list or [], ensure_ascii=False), now,
-        )
+    await _orig_save_interview(company, vacancy_id, notes, questions_list)
 
 
-async def get_interview_history(limit: int = 10) -> list[dict]:
-    cid = _cid()
+async def get_interview_history(limit: int = 10, chat_id: int | None = None) -> list[dict]:
+    cid = int(chat_id) if chat_id is not None else _cid()
     if _mu():
         if cid is None:
             raise RuntimeError("get_interview_history requires chat_id in multi-user mode")
         import user_data
         return await _conn_call(user_data.get_user_interview_history, cid, limit)
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        try:
-            rows = await conn.fetch(
-                "SELECT * FROM interview_history ORDER BY created_at DESC LIMIT " + D + "1", limit
-            )
-            out = []
-            for r in rows:
-                d = _row_to_dict(r)
-                if "questions_list" not in d and d.get("questions") is not None:
-                    q = d["questions"]
-                    d["questions_list"] = q if isinstance(q, str) else json.dumps(q, ensure_ascii=False)
-                out.append(d)
-            return out
-        except Exception:
-            return []
-
-# ── chat_id scoped cover / interview (prod multi-user) ───────────────────────
-
-async def _ensure_chat_scoped_columns(conn) -> None:
-    try:
-        await conn.execute(
-            "ALTER TABLE cover_examples ADD COLUMN IF NOT EXISTS chat_id BIGINT"
-        )
-        await conn.execute(
-            "ALTER TABLE interview_history ADD COLUMN IF NOT EXISTS chat_id BIGINT"
-        )
-    except Exception:
-        pass
-
-
-async def save_cover_example(text: str, chat_id: int | None = None, **kwargs) -> None:
-    """Save cover example scoped to chat_id when multi-user."""
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        await _ensure_chat_scoped_columns(conn)
-        cols = await conn.fetch(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name='cover_examples'"
-        )
-        names = {r["column_name"] for r in cols}
-        if "chat_id" in names and chat_id is not None:
-            # Prefer generic insert; fall back to (text, chat_id)
-            try:
-                await conn.execute(
-                    "INSERT INTO cover_examples (text, chat_id) VALUES ($1, $2)",
-                    text, int(chat_id),
-                )
-            except Exception:
-                await conn.execute(
-                    "INSERT INTO cover_examples (content, chat_id) VALUES ($1, $2)",
-                    text, int(chat_id),
-                )
-        else:
-            try:
-                await conn.execute("INSERT INTO cover_examples (text) VALUES ($1)", text)
-            except Exception:
-                await conn.execute("INSERT INTO cover_examples (content) VALUES ($1)", text)
-
-
-async def get_cover_examples(chat_id: int | None = None, limit: int = 20):
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        await _ensure_chat_scoped_columns(conn)
-        has = await conn.fetchval(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name='cover_examples' AND column_name='chat_id'"
-        )
-        if has and chat_id is not None:
-            rows = await conn.fetch(
-                "SELECT * FROM cover_examples WHERE chat_id=$1 "
-                "ORDER BY id DESC NULLS LAST LIMIT $2",
-                int(chat_id), limit,
-            )
-        elif has and chat_id is not None:
-            rows = []
-        else:
-            rows = await conn.fetch(
-                "SELECT * FROM cover_examples ORDER BY id DESC NULLS LAST LIMIT $1",
-                limit,
-            )
-        return [dict(r) for r in rows]
-
-
-async def save_interview(question: str, answer: str, chat_id: int | None = None, **kwargs) -> None:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        await _ensure_chat_scoped_columns(conn)
-        has = await conn.fetchval(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name='interview_history' AND column_name='chat_id'"
-        )
-        if has and chat_id is not None:
-            try:
-                await conn.execute(
-                    "INSERT INTO interview_history (question, answer, chat_id) "
-                    "VALUES ($1, $2, $3)",
-                    question, answer, int(chat_id),
-                )
-            except Exception:
-                await conn.execute(
-                    "INSERT INTO interview_history (q, a, chat_id) VALUES ($1, $2, $3)",
-                    question, answer, int(chat_id),
-                )
-        else:
-            try:
-                await conn.execute(
-                    "INSERT INTO interview_history (question, answer) VALUES ($1, $2)",
-                    question, answer,
-                )
-            except Exception:
-                pass
-
-
-async def get_interview_history(chat_id: int | None = None, limit: int = 50):
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        await _ensure_chat_scoped_columns(conn)
-        has = await conn.fetchval(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name='interview_history' AND column_name='chat_id'"
-        )
-        if has and chat_id is not None:
-            rows = await conn.fetch(
-                "SELECT * FROM interview_history WHERE chat_id=$1 "
-                "ORDER BY id DESC NULLS LAST LIMIT $2",
-                int(chat_id), limit,
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT * FROM interview_history ORDER BY id DESC NULLS LAST LIMIT $1",
-                limit,
-            )
-        return [dict(r) for r in rows]
+    return await _orig_get_interview_history(limit)
 
 
 # === EARS_FREQ ===
@@ -1881,8 +1752,12 @@ async def get_feed_ttl_days_for_chat(chat_id: int) -> int:
 
 # === KEYWORDS FROM RESUME ===
 
-def keywords_from_profile(profile: dict | None, limit: int = 12) -> list[str]:
-    """Extract search keywords from saved resume profile (role / skills / domains)."""
+def keywords_from_profile(profile: dict | None, limit: int = 8) -> list[str]:
+    """Extract search keywords from resume profile — job titles/roles only.
+
+    Skills/domains/duties are not search queries: they flood Habr/Getmatch and
+    dilute hh NAME: boolean. Manual /addkeyword still allowed separately.
+    """
     if not isinstance(profile, dict):
         return []
     out: list[str] = []
@@ -1895,19 +1770,26 @@ def keywords_from_profile(profile: dict | None, limit: int = 12) -> list[str]:
                 _add(x)
             return
         s = str(v).strip()
-        if len(s) < 2 or len(s) > 80:
+        if len(s) < 2 or len(s) > 60:
             return
-        # skip noisy long sentences
-        if s.count(" ") > 6:
+        # skip duty sentences / bullet noise
+        if s.count(" ") > 5:
             return
-        low = s.lower()
+        low = s.lower().replace("ё", "е")
+        if low.startswith(("управлен", "формирован", "координац", "взаимодейств", "анализ ", "сбор ")):
+            return
         if any(x.lower() == low for x in out):
             return
+        try:
+            from title_filter import is_search_keyword
+            if not is_search_keyword(s):
+                return
+        except Exception:
+            pass
         out.append(s)
 
-    for key in ("role", "desired_role", "target_role", "position", "title"):
-        _add(profile.get(key))
-    for key in ("key_skills", "tech_stack", "domains", "methodologies"):
+    # Role / title fields only (no key_skills / tech_stack / domains / methodologies)
+    for key in ("target_role", "desired_role", "role", "position", "current_title", "title"):
         _add(profile.get(key))
     return out[:limit]
 

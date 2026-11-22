@@ -188,9 +188,10 @@ async def poll_habr(progress_callback=None) -> int:
 
     for idx, keyword in enumerate(keywords, 1):
         if progress_callback:
+            short = keyword if len(keyword) < 40 else keyword[:37] + "…"
             await progress_callback(
-                f"🔍 [{idx}/{total_kw}] Хабр: {keyword}...\n"
-                f"📥 Новых найдено: {new_count}"
+                f"Хабр: {idx}/{total_kw} — «{short}»\n"
+                f"Новых пока: {new_count}"
             )
 
         items = await _parse_rss(keyword)

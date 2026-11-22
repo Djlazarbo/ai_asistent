@@ -282,11 +282,18 @@ async def poll_hh(progress_callback=None):
         try:
             for idx, keyword in enumerate(queries, 1):
                 if progress_callback:
-                    label = keyword if len(keyword) < 80 else keyword[:77] + "…"
-                    await progress_callback(
-                        f"🔍 [{idx}/{total_kw}] Ищу: {label}...\n"
-                        f"📥 Новых найдено: {new_count}"
-                    )
+                    if user_is_pm_searcher(keywords) and total_kw == 1:
+                        status = (
+                            f"hh.ru: поиск по вашим словам ({len(keywords)})…\n"
+                            f"Новых пока: {new_count}"
+                        )
+                    else:
+                        short = keyword if len(keyword) < 40 else keyword[:37] + "…"
+                        status = (
+                            f"hh.ru: {idx}/{total_kw} — «{short}»\n"
+                            f"Новых пока: {new_count}"
+                        )
+                    await progress_callback(status)
 
                 all_items: list[dict] = []
                 for extra in search_configs:
@@ -355,31 +362,325 @@ async def poll_hh(progress_callback=None):
     return new_count
 
 
+def _env_flag(name: str, default: str = "1") -> bool:
+    return (os.getenv(name) or default).strip().lower() in ("1", "true", "yes", "on")
+
+
 async def _scheduled_run():
     from habr_poller import poll_habr
     from getmatch_poller import poll_getmatch
+
     logger.info("Scheduled poll starting (hh + habr + getmatch)")
     hh_count = await poll_hh()
     habr_count = await poll_habr()
-    getmatch_count = await poll_getmatch()
+    if _env_flag("GETMATCH_ENABLED", "0"):
+        getmatch_count = await poll_getmatch()
+    else:
+        getmatch_count = 0
+        logger.info("Getmatch skipped (GETMATCH_ENABLED=0)")
     logger.info(f"Total new: hh={hh_count}, habr={habr_count}, getmatch={getmatch_count}")
 
 
+# ── On-demand HTTP API for bot /searchnow (POLLER_URL=http://poller:5680) ───
+POLLER_HTTP_PORT = int(os.getenv("POLLER_HTTP_PORT") or "5680")
+_SEARCH_COOLDOWN_SEC = int(os.getenv("SEARCH_COOLDOWN_SEC") or str(60 * 60))
+
+_progress: dict[int, dict] = {}
+_queue: asyncio.Queue | None = None
+_busy_chat: int | None = None
+_queued_chats: set[int] = set()
+_last_search_ts: dict[int, float] = {}
+_worker_task: asyncio.Task | None = None
+_active_tasks: dict[int, asyncio.Task] = {}
+_cancel_requested: set[int] = set()
+_pw_cached: bool | None = None
+
+
+def _set_progress(chat_id: int, text: str, **extra) -> None:
+    payload = {"text": text, "chat_id": int(chat_id)}
+    payload.update(extra)
+    _progress[int(chat_id)] = payload
+
+
+def _check_cancelled(chat_id: int) -> None:
+    if int(chat_id) in _cancel_requested:
+        raise asyncio.CancelledError()
+
+
+async def _run_user_search(chat_id: int) -> dict:
+    """Run hh+habr(+optional getmatch) in the request chat context."""
+    from habr_poller import poll_habr
+    from getmatch_poller import poll_getmatch
+
+    token = db.set_request_chat_id(int(chat_id))
+    try:
+        async def progress_callback(t: str):
+            _check_cancelled(chat_id)
+            _set_progress(chat_id, t)
+
+        _check_cancelled(chat_id)
+        _set_progress(chat_id, "🔍 Запускаю поиск hh.ru…")
+        hh_count = await poll_hh(progress_callback=progress_callback)
+        _check_cancelled(chat_id)
+        _set_progress(chat_id, f"🔍 Хабр… (hh новых: {hh_count})")
+        habr_count = await poll_habr(progress_callback=progress_callback)
+        _check_cancelled(chat_id)
+        if _env_flag("GETMATCH_ENABLED", "0"):
+            _set_progress(chat_id, f"🔍 Getmatch… (hh={hh_count}, habr={habr_count})")
+            getmatch_count = await poll_getmatch(progress_callback=progress_callback)
+        else:
+            getmatch_count = 0
+        total = int(hh_count or 0) + int(habr_count or 0) + int(getmatch_count or 0)
+        # Multi-user: pool often already has owner-scraped cards → 0 "new".
+        # Attach matching recent pool vacancies to this user's feed.
+        backfilled = 0
+        try:
+            _set_progress(chat_id, f"📥 Подбираю подходящие из базы… (свежих: {total})")
+            from user_feed_backfill import backfill_user_feed
+
+            bf = await backfill_user_feed(int(chat_id), days=7, limit=40, notify=False)
+            backfilled = int(bf.get("ok") or 0)
+        except Exception as e:
+            logger.warning(f"backfill after search chat={chat_id}: {e}")
+        text = (
+            f"Поиск завершён\n"
+            f"hh.ru: {hh_count}\n"
+            f"Хабр: {habr_count}\n"
+            f"Getmatch: {getmatch_count}\n"
+            f"Итого новых: {total}"
+        )
+        if backfilled:
+            text += f"\nИз базы к вашей ленте: +{backfilled}"
+        _set_progress(chat_id, text)
+        return {
+            "ok": True,
+            "text": text,
+            "total": total + backfilled,
+            "hh": hh_count,
+            "habr": habr_count,
+            "getmatch": getmatch_count,
+            "backfilled": backfilled,
+        }
+    finally:
+        db.reset_request_chat_id(token)
+
+
+async def _search_worker() -> None:
+    global _busy_chat
+    assert _queue is not None
+    while True:
+        chat_id, fut = await _queue.get()
+        chat_id = int(chat_id)
+        _queued_chats.discard(chat_id)
+        if chat_id in _cancel_requested:
+            _cancel_requested.discard(chat_id)
+            _set_progress(chat_id, "⏹ Поиск отменён")
+            if not fut.done():
+                fut.set_result({"ok": True, "cancelled": True, "text": "⏹ Поиск отменён"})
+            _queue.task_done()
+            continue
+        _busy_chat = chat_id
+        task = asyncio.create_task(_run_user_search(chat_id))
+        _active_tasks[chat_id] = task
+        try:
+            _set_progress(chat_id, "🔍 Идёт поиск, пожалуйста подождите…")
+            result = await task
+            if not result.get("cancelled"):
+                _last_search_ts[chat_id] = datetime.utcnow().timestamp()
+            if not fut.done():
+                fut.set_result(result)
+        except asyncio.CancelledError:
+            _set_progress(chat_id, "⏹ Поиск отменён")
+            if not fut.done():
+                fut.set_result({"ok": True, "cancelled": True, "text": "⏹ Поиск отменён"})
+        except Exception as e:
+            logger.exception(f"searchnow failed chat={chat_id}: {e}")
+            err = {"ok": False, "error": str(e)}
+            _set_progress(chat_id, f"❌ Ошибка поиска: {e}")
+            if not fut.done():
+                fut.set_result(err)
+        finally:
+            _active_tasks.pop(chat_id, None)
+            _cancel_requested.discard(chat_id)
+            _busy_chat = None
+            _queue.task_done()
+
+
+def _queue_position(chat_id: int) -> int | None:
+    if _busy_chat == int(chat_id):
+        return 0
+    if int(chat_id) not in _queued_chats:
+        return None
+    return max(1, len(_queued_chats))
+
+
+async def _http_health(request):
+    from aiohttp import web
+
+    global _pw_cached
+    qlen = _queue.qsize() if _queue is not None else 0
+    if _pw_cached is None and _busy_chat is None:
+        try:
+            _pw_cached = await asyncio.get_running_loop().run_in_executor(
+                None, _playwright_ready
+            )
+        except Exception:
+            _pw_cached = False
+    elif _pw_cached is None:
+        _pw_cached = True
+    return web.json_response(
+        {
+            "ok": True,
+            "playwright": bool(_pw_cached),
+            "busy": _busy_chat is not None,
+            "busy_chat": _busy_chat,
+            "queue_len": qlen,
+            "position": qlen,
+            "eta_min": max(1, (qlen + (1 if _busy_chat else 0)) * 10),
+            "getmatch": _env_flag("GETMATCH_ENABLED", "0"),
+        }
+    )
+
+
+async def _http_progress(request):
+    from aiohttp import web
+
+    try:
+        chat_id = int(request.query.get("chat_id") or "0")
+    except ValueError:
+        chat_id = 0
+    data = dict(_progress.get(chat_id) or {})
+    pos = _queue_position(chat_id)
+    if pos is not None:
+        data.setdefault("position", pos + (1 if _busy_chat and _busy_chat != chat_id else 0))
+        data.setdefault("eta_min", int(data["position"]) * 10)
+    if not data.get("text"):
+        if _busy_chat == chat_id:
+            data["text"] = "🔍 Идёт поиск, пожалуйста подождите…"
+        elif pos is not None:
+            data["text"] = f"⏳ Вы в очереди (~{data.get('eta_min', 10)} мин)"
+        else:
+            data["text"] = ""
+    data["chat_id"] = chat_id or data.get("chat_id")
+    return web.json_response(data)
+
+
+async def _http_cancel(request):
+    from aiohttp import web
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        chat_id = int(body.get("chat_id") or request.query.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        chat_id = 0
+    if not chat_id:
+        return web.json_response({"ok": False, "error": "chat_id required"}, status=400)
+
+    _cancel_requested.add(chat_id)
+    _queued_chats.discard(chat_id)
+    task = _active_tasks.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+    _set_progress(chat_id, "⏹ Отмена…")
+    return web.json_response({"ok": True, "text": "⏹ Поиск отменён (или будет пропущен в очереди)"})
+
+
+async def _http_searchnow(request):
+    from aiohttp import web
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        chat_id = int(body.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        chat_id = 0
+    if not chat_id:
+        return web.json_response({"ok": False, "error": "chat_id required"}, status=400)
+
+    _cancel_requested.discard(chat_id)
+    now = datetime.utcnow().timestamp()
+    last = _last_search_ts.get(chat_id) or 0
+    if now - last < _SEARCH_COOLDOWN_SEC and _busy_chat != chat_id and chat_id not in _queued_chats:
+        left = int(_SEARCH_COOLDOWN_SEC - (now - last))
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "rate_limited",
+                "text": (
+                    "⏳ Поиск можно запускать не чаще 1 раза в час "
+                    f"(личный лимит; ещё ~{max(1, left // 60)} мин)."
+                ),
+            },
+            status=429,
+        )
+
+    if _busy_chat == chat_id or chat_id in _queued_chats:
+        prog = (_progress.get(chat_id) or {}).get("text") or ""
+        return web.json_response(
+            {"ok": False, "error": "busy", "text": prog},
+            status=409,
+        )
+
+    assert _queue is not None
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    _queued_chats.add(chat_id)
+    qlen = _queue.qsize() + (1 if _busy_chat else 0)
+    _set_progress(
+        chat_id,
+        f"⏳ Вы ~{qlen + 1}-й в очереди, ~{(qlen + 1) * 10} мин. Только ваши keywords.",
+        position=qlen + 1,
+        eta_min=(qlen + 1) * 10,
+    )
+    await _queue.put((chat_id, fut))
+    result = await fut
+    if result.get("cancelled"):
+        return web.json_response(result, status=200)
+    status = 200 if result.get("ok") else 500
+    return web.json_response(result, status=status)
+
+
 async def run_daemon():
+    from aiohttp import web
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    global _queue, _worker_task
+
     await db.init_db()
+    _queue = asyncio.Queue()
+    _worker_task = asyncio.create_task(_search_worker())
+
+    app = web.Application()
+    app.router.add_get("/health", _http_health)
+    app.router.add_get("/progress", _http_progress)
+    app.router.add_post("/searchnow", _http_searchnow)
+    app.router.add_post("/cancel", _http_cancel)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", POLLER_HTTP_PORT)
+    await site.start()
+    logger.info(f"poller HTTP on :{POLLER_HTTP_PORT} (/health /searchnow /progress /cancel)")
+
     scheduler = AsyncIOScheduler()
     poll_time = _config["hh"].get("poll_time", "09:00")
     hour, minute = map(int, poll_time.split(":"))
     scheduler.add_job(_scheduled_run, "cron", hour=hour, minute=minute)
     scheduler.start()
-    logger.info(f"hh poller daemon started. Next run at {poll_time} daily.")
-    await _scheduled_run()
+    logger.info(
+        f"hh poller daemon started. Next cron at {poll_time} daily "
+        f"(no scrape on restart; GETMATCH_ENABLED={_env_flag('GETMATCH_ENABLED', '0')})"
+    )
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

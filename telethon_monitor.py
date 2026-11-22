@@ -227,6 +227,25 @@ async def _subscribe_channel(username: str) -> bool:
     return False
 
 
+async def _any_user_monitoring() -> bool:
+    """Ingest gate for multi-user: open while ANY active user monitors.
+
+    The old check `db.is_monitoring_active()` read the legacy global flag (the
+    owner's) — one user pausing monitoring stopped TG ingest for everyone.
+    """
+    try:
+        if hasattr(db, "list_active_users_for_scoring"):
+            ids = await db.list_active_users_for_scoring()
+            if ids and hasattr(db, "is_monitoring_for_chat"):
+                for cid in ids:
+                    if await db.is_monitoring_for_chat(int(cid)):
+                        return True
+                return False
+    except Exception as e:
+        logger.warning(f"any_user_monitoring check failed, using legacy flag: {e}")
+    return await db.is_monitoring_active()
+
+
 async def refresh_channels():
     """Pick up newly added channels and immediately catch up their recent history."""
     channels = await db.get_active_channels()
@@ -248,7 +267,7 @@ async def on_new_message(event):
     if username not in _active_channels:
         return
 
-    if not await db.is_monitoring_active():
+    if not await _any_user_monitoring():
         return
 
     processed = await _process_message(chat.username or "", chat.id, event.message)

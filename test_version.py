@@ -22,5 +22,5 @@ def test_changelog_headline():
 
 def test_version_message_contains_version():
     msg = v.version_message()
-    assert "1.2.0" in msg
+    assert v.get_version() in msg
     assert "Job Hunter" in msg

@@ -1593,6 +1593,8 @@ def _is_relevant(v: dict, kw_lower: list[str]) -> bool:
 
 @owner_only
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_allowed(update.effective_chat.id):
+        return
     _cid = update.effective_chat.id if update.effective_chat else None
     _tok = db.set_request_chat_id(_cid) if _cid else None
     try:
@@ -2306,6 +2308,8 @@ async def retry_scoring_job(context: ContextTypes.DEFAULT_TYPE):
 # ── Menu & navigation callbacks ────────────────────────────────────────────────
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or not await _is_allowed(update.effective_chat.id):
+        return
     _cid = update.effective_chat.id if update.effective_chat else None
     _tok = db.set_request_chat_id(_cid) if _cid else None
     try:
@@ -2888,6 +2892,8 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Detail view callback ───────────────────────────────────────────────────────
 
 async def handle_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or not await _is_allowed(update.effective_chat.id):
+        return
     _cid = update.effective_chat.id if update.effective_chat else None
     _tok = db.set_request_chat_id(_cid) if _cid else None
     try:
@@ -3234,6 +3240,8 @@ async def cmd_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_favorites_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or not await _is_allowed(update.effective_chat.id):
+        return
     _cid = update.effective_chat.id if update.effective_chat else None
     _tok = db.set_request_chat_id(_cid) if _cid else None
     try:
@@ -3324,6 +3332,8 @@ async def _handle_favorites_callback_body(update: Update, context: ContextTypes.
 # ── Action callbacks ───────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or not await _is_allowed(update.effective_chat.id):
+        return
     _cid = update.effective_chat.id if update.effective_chat else None
     _tok = db.set_request_chat_id(_cid) if _cid else None
     try:
@@ -3893,6 +3903,8 @@ async def cmd_menu_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_allowed(update.effective_chat.id):
+        return
     # Scope to the caller's feed — without the token this fell back to the
     # legacy global table and leaked it to unregistered chats.
     _cid = update.effective_chat.id if update.effective_chat else None

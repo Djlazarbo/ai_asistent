@@ -348,3 +348,72 @@ async def test_tg_notify_send_fails_closed_without_token(monkeypatch):
 
     monkeypatch.setattr(tg_notify, "_bot_token", lambda: "")
     assert await tg_notify.send_vacancy_push(1, {"title": "t"}) is False
+
+
+# ── search must not freeze the bot (sequential updates + inline await) ────────
+
+def test_builder_enables_concurrent_updates():
+    """Without concurrent_updates(True) PTB processes updates one-by-one:
+    a 10-30 min search handler froze the whole bot for every user."""
+    import inspect
+    import bot
+
+    assert "concurrent_updates(True)" in inspect.getsource(bot)
+
+
+@pytest.mark.asyncio
+async def test_spawn_search_runs_in_background(monkeypatch):
+    import asyncio as _aio
+    import bot
+
+    bot._search_tasks.clear()
+    started = _aio.Event()
+    release = _aio.Event()
+
+    async def fake_exec(chat_id, progress_callback=None):
+        started.set()
+        await release.wait()
+        return "Поиск завершён", True
+
+    monkeypatch.setattr(bot, "_execute_search_now", fake_exec)
+    monkeypatch.setattr(bot, "_edit_search_progress", AsyncMock())
+    msg = AsyncMock()
+
+    task = bot._spawn_search(42, msg)
+    # handler-style flow: _spawn_search returned without waiting for the search
+    await _aio.wait_for(started.wait(), timeout=2)
+    msg.edit_text.assert_not_called()  # result not delivered until search ends
+
+    release.set()
+    await _aio.wait_for(task, timeout=2)
+    assert msg.edit_text.called
+    assert "Поиск завершён" in str(msg.edit_text.call_args)
+
+
+@pytest.mark.asyncio
+async def test_spawn_search_double_click_dedup(monkeypatch):
+    import asyncio as _aio
+    import bot
+
+    bot._search_tasks.clear()
+    release = _aio.Event()
+    calls = []
+
+    async def fake_exec(chat_id, progress_callback=None):
+        calls.append(chat_id)
+        await release.wait()
+        return "done", True
+
+    monkeypatch.setattr(bot, "_execute_search_now", fake_exec)
+    monkeypatch.setattr(bot, "_edit_search_progress", AsyncMock())
+    msg1, msg2 = AsyncMock(), AsyncMock()
+
+    bot._spawn_search(7, msg1)
+    bot._spawn_search(7, msg2)  # second click while first still running
+    await _aio.sleep(0.05)  # let the background tasks start
+
+    assert len(calls) == 1  # no duplicate search launched
+    assert msg2.edit_text.called  # user told a search is already running
+    release.set()
+    await _aio.sleep(0.05)
+    bot._search_tasks.clear()

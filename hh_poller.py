@@ -88,10 +88,12 @@ async def _new_page(browser: Browser) -> Page:
 
 
 async def _salary_extra_params() -> str:
-    """Optional &salary=&only_with_salary=true from per-user salary_from setting."""
+    """Optional &salary=&only_with_salary=true from per-user salary wish."""
     try:
         raw = await db.get_setting("salary_from")
-        if raw is None:
+        if raw is None or str(raw).strip() == "":
+            raw = await db.get_setting("wish_salary_min")
+        if raw is None or str(raw).strip() == "":
             return ""
         n = int(str(raw).strip().replace(" ", "").replace("\u00a0", ""))
         if n >= 10000:
@@ -99,6 +101,24 @@ async def _salary_extra_params() -> str:
     except Exception:
         pass
     return ""
+
+
+def _filter_configs_by_wish(configs: list[str], wish: dict | None) -> list[str]:
+    """Narrow the fixed experience×format grid by the user's wish profile
+    (personal search context only). Falls back to the full grid if empty."""
+    wish = wish or {}
+    exp = wish.get("wish_experience") or "any"
+    fmt = wish.get("wish_format") or "any"
+    out = configs
+    if exp != "any":
+        out = [c for c in out if f"experience={exp}" in c] or configs
+    if fmt == "remote":
+        out = [c for c in out if "schedule=remote" in c] or configs
+    elif fmt == "office":
+        out = [c for c in out if "area=" in c and "work_format" not in c] or configs
+    elif fmt == "hybrid":
+        out = [c for c in out if "work_format=HYBRID" in c] or configs
+    return out
 
 
 async def _scrape_vacancies(browser: Browser, keyword: str, extra_params: str, date_from: str, max_pages: int = 3) -> list[dict]:
@@ -267,6 +287,22 @@ async def poll_hh(progress_callback=None):
     if salary_extra:
         search_configs = [c + salary_extra for c in search_configs]
         logger.info(f"hh poll: salary filter applied {salary_extra}")
+
+    # Personal search: apply the requesting user's wish profile (experience/format).
+    try:
+        import user_data as _ud
+
+        _cid_now = _ud.current_chat_id()
+        if _cid_now and hasattr(db, "get_wish_profile_for_chat"):
+            _wish = await db.get_wish_profile_for_chat(int(_cid_now)) or {}
+            before = len(search_configs)
+            search_configs = _filter_configs_by_wish(search_configs, _wish)
+            logger.info(
+                f"hh poll: wishes chat={_cid_now} exp={_wish.get('wish_experience')} "
+                f"fmt={_wish.get('wish_format')} configs {before}→{len(search_configs)}"
+            )
+    except Exception as e:
+        logger.warning(f"hh poll: wish filter failed: {e}")
 
     if user_is_pm_searcher(keywords):
         q = build_pm_hh_query(keywords)

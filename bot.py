@@ -692,7 +692,10 @@ async def _profile_text_and_keyboard():
             ears = await db.get_ears_freq()
     except Exception:
         ears = "hourly"
-    ears_label = {"hourly": "раз в час", "daily": "раз в день", "twice": "2 раза в день"}.get(ears, "раз в час")
+    ears_label = {
+        "hourly": "раз в час", "daily": "раз в день", "twice": "2 раза в день",
+        "instant": "мгновенно",
+    }.get(ears, "раз в час")
     quiet_on = True
     try:
         if hasattr(db, "get_quiet_hours"):
@@ -729,6 +732,7 @@ async def _profile_text_and_keyboard():
             InlineKeyboardButton("📄 Резюме", callback_data="s_resume"),
             InlineKeyboardButton("👁 Смотреть профиль", callback_data="s_myprofile"),
         ],
+        [InlineKeyboardButton("🎯 Мои хотелки", callback_data="s_wish")],
         [notify_btn],
         [InlineKeyboardButton(f"⏱ Частота: {ears_label}", callback_data="s_ears")],
         [InlineKeyboardButton(f"🌙 Тихие часы: {quiet_label}", callback_data="s_quiet")],
@@ -737,6 +741,7 @@ async def _profile_text_and_keyboard():
             InlineKeyboardButton("📊 Порог", callback_data="s_thr"),
             mon_btn,
         ],
+        [InlineKeyboardButton("❓ Почему мало вакансий", callback_data="s_whyfew")],
         [InlineKeyboardButton("🏠 Сегодня", callback_data="menu_main")],
     ])
     return text, keyboard
@@ -1388,12 +1393,20 @@ async def cmd_addkeyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /addkeyword Слово")
         return
     word = " ".join(context.args)
+    from title_filter import explain_keyword
+
+    status, reason = explain_keyword(word)
+    if status == "rejected":
+        await update.message.reply_text(f"❌ «{word}» не добавлено.\n{reason}")
+        return
     await db.add_keyword(word)
     ready, meta = await _user_search_ready()
     extra = ""
     if ready:
         extra = "\n✅ Поиск готов. Можно «Искать сейчас» и /notify on."
-    await update.message.reply_text(f"✅ Добавлено: {word}{extra}")
+    prefix = "⚠️" if status == "broad" else "✅"
+    note = f"\n{reason}" if status == "broad" else ""
+    await update.message.reply_text(f"{prefix} Добавлено: {word}{note}{extra}")
 
 
 @owner_only
@@ -1682,6 +1695,189 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
 
+def _parse_salary_range(text: str) -> tuple[int | None, int | None]:
+    """'от 250 до 400' / '250-400' / '250' / 'до 400' → (min, max)."""
+    cleaned = (text or "").replace(" ", "").replace("\u00a0", "")
+    nums = [int(n) for n in re.findall(r"\d{3,7}", cleaned)]
+    if not nums:
+        return (None, None)
+    nums = sorted(set(nums))
+    if len(nums) == 1:
+        return (None, nums[0]) if "до" in (text or "").lower() else (nums[0], None)
+    return (nums[0], nums[-1])
+
+
+async def _wish_screen(chat_id: int):
+    """Text + keyboard for the per-user wish profile screen."""
+    w = (
+        await db.get_wish_profile_for_chat(int(chat_id))
+        if hasattr(db, "get_wish_profile_for_chat")
+        else {}
+    ) or {}
+    smin, smax = w.get("wish_salary_min"), w.get("wish_salary_max")
+    if smin and smax:
+        money = f"от {smin} до {smax} тыс ₽"
+    elif smin:
+        money = f"от {smin} тыс ₽"
+    elif smax:
+        money = f"до {smax} тыс ₽"
+    else:
+        money = "не задана"
+    def _lbl(field, val):
+        return db.wish_label(field, val) if hasattr(db, "wish_label") else (val or "—")
+    text = (
+        "🎯 Мои хотелки\n\n"
+        "Что важно именно вам. Влияет на поиск и оценку вакансий.\n\n"
+        f"🎯 Роль: {w.get('wish_role') or '—'}\n"
+        f"💰 Зарплата: {money}\n"
+        f"🏠 Формат: {_lbl('wish_format', w.get('wish_format'))}\n"
+        f"🎓 Опыт: {_lbl('wish_experience', w.get('wish_experience'))}\n"
+        f"📍 Регион: {_lbl('wish_location', w.get('wish_location'))}\n"
+        f"🚫 Не показывать: {w.get('wish_exclude') or '—'}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Роль", callback_data="s_wish_role")],
+        [InlineKeyboardButton("💰 Зарплата", callback_data="s_wish_money")],
+        [InlineKeyboardButton("🏠 Формат", callback_data="s_wish_format")],
+        [InlineKeyboardButton("🎓 Опыт", callback_data="s_wish_exp")],
+        [InlineKeyboardButton("📍 Регион", callback_data="s_wish_loc")],
+        [InlineKeyboardButton("🚫 Не показывать", callback_data="s_wish_exclude")],
+        [InlineKeyboardButton("◀️ Профиль", callback_data="menu_profile")],
+    ])
+    return text, keyboard
+
+
+async def _whyfew_text(chat_id: int) -> str:
+    """Per-user diagnostics: readiness, effective keywords, wishes, feed growth."""
+    from title_filter import is_search_keyword, keywords_feedback
+
+    cid = int(chat_id)
+    lines = ["❓ Почему мало вакансий — разбор\n"]
+
+    # 1. Readiness
+    ready, hint = await _user_search_ready(cid)
+    lines.append(("✅" if ready else "❌") + " " + (hint or "Профиль поиска готов."))
+
+    # 2. Resume
+    try:
+        profile = await db.get_active_profile()
+    except Exception:
+        profile = None
+    lines.append(("✅ Резюме загружено" if profile else "❌ Резюме не загружено — /resume"))
+
+    # 3. Keywords: raw vs really searched
+    try:
+        kws = await db.get_keywords() or []
+    except Exception:
+        kws = []
+    fb = keywords_feedback(kws)
+    ok_n = sum(1 for _, s, _ in fb if s == "ok")
+    rejected = [k for k, s, _ in fb if s == "rejected"]
+    broad = [k for k, s, _ in fb if s == "broad"]
+    if kws:
+        lines.append(
+            f"{'✅' if ok_n and not rejected else '⚠️' if ok_n else '❌'} "
+            f"Ключевых слов: {len(kws)}, реально ищется: {ok_n}"
+        )
+        if rejected:
+            lines.append("   ❌ НЕ ищутся: " + ", ".join(rejected[:6]))
+        if broad:
+            lines.append("   ⚠️ Широкие (много мусора): " + ", ".join(broad[:6]))
+    else:
+        lines.append("❌ Ключевых слов нет — добавьте в «Слова»")
+
+    # 4. Channels
+    try:
+        chs = await db.get_all_channels()
+        ch_active = sum(1 for c in chs if c.get("active"))
+    except Exception:
+        ch_active = 0
+    lines.append(("✅" if ch_active else "⚠️") + f" TG-каналов: {ch_active}" + ("" if ch_active else " — без них Telegram-вакансии не приходят"))
+
+    # 5. Wishes (visibility)
+    try:
+        w = await db.get_wish_profile_for_chat(cid)
+        wish_bits = []
+        if w.get("wish_salary_min") or w.get("wish_salary_max"):
+            wish_bits.append(f"зарплата {w.get('wish_salary_min') or '…'}–{w.get('wish_salary_max') or '…'}")
+        if w.get("wish_format") and w["wish_format"] != "any":
+            wish_bits.append("формат " + w["wish_format"])
+        if w.get("wish_experience") and w["wish_experience"] != "any":
+            wish_bits.append("опыт " + w["wish_experience"])
+        if w.get("wish_exclude"):
+            wish_bits.append(f"исключения: {w['wish_exclude'][:40]}")
+        if wish_bits:
+            lines.append("🎯 Хотелки: " + "; ".join(wish_bits) + " (сужают выдачу — это нормально)")
+    except Exception:
+        pass
+
+    # 6. Feed growth 7d
+    try:
+        if hasattr(db, "user_feed_stats_7d_for_chat"):
+            st = await db.user_feed_stats_7d_for_chat(cid)
+            lines.append(
+                f"📊 За 7 дней: в общий пул +{st['pool_7d']}, к вам попало {st['uv_total_7d']} "
+                f"(новых {st['uv_7d'].get('new', 0)}, пропущено {st['uv_7d'].get('skipped', 0)})"
+            )
+            if st["pool_7d"] > 0 and st["uv_total_7d"] == 0:
+                lines.append("   ⚠️ Пул растёт, а ваша лента нет — проверьте слова/каналы выше")
+    except Exception:
+        pass
+
+    lines.append("\nЛента также пополняется сама каждые ~2 часа из общих находок.")
+    return "\n".join(lines)
+
+
+def _digest_due(freq: str, last_msk, now) -> bool:
+    """Batch digest schedule per ears mode. 'instant' users get per-vacancy
+    pushes from score_server — a batch digest would duplicate them."""
+    if freq == "instant":
+        return False
+    if freq == "daily":
+        return now.hour == 9 and (last_msk is None or last_msk.date() < now.date())
+    if freq == "twice":
+        return now.hour in (9, 18) and (
+            last_msk is None
+            or last_msk.date() < now.date()
+            or last_msk.hour != now.hour
+        )
+    # hourly / default
+    return last_msk is None or (now - last_msk) >= datetime.timedelta(hours=1)
+
+
+async def backfill_job(context):
+    """Every ~2h: attach fresh pool cards to every search-ready user's feed.
+
+    Before this, a user's feed only grew after their own «Искать сейчас» —
+    the #1 'bot doesn't monitor for me' complaint. notify=False: cards just
+    land in the feed; digests/pushes deliver them per user's ears mode.
+    """
+    if (os.getenv("BACKFILL_JOB", "1") or "1").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    from user_feed_backfill import backfill_user_feed
+
+    try:
+        ids = await db.list_active_user_chat_ids()
+    except Exception as e:
+        logger.warning(f"backfill_job: user list failed: {e}")
+        return
+    total = 0
+    for cid in ids or []:
+        try:
+            ready, _hint = await _user_search_ready(int(cid))
+            if not ready:
+                continue
+            if hasattr(db, "is_monitoring_for_chat") and not await db.is_monitoring_for_chat(int(cid)):
+                continue
+            bf = await backfill_user_feed(int(cid), days=1, limit=20, notify=False)
+            total += int(bf.get("ok") or 0)
+            await asyncio.sleep(2)  # pace DeepSeek scoring behind the webhook
+        except Exception as e:
+            logger.warning(f"backfill_job chat={cid}: {e}")
+    if total:
+        logger.info(f"backfill_job: attached {total} pool cards across {len(ids or [])} users")
+
+
 async def ears_digest_job(context: ContextTypes.DEFAULT_TYPE):
     """Send batched vacancy digests per user ears_freq (hourly/daily/twice)."""
     try:
@@ -1741,24 +1937,8 @@ async def ears_digest_job(context: ContextTypes.DEFAULT_TYPE):
                     last = last.replace(tzinfo=timezone.utc)
                 last_msk = last.astimezone(msk) if last is not None else None
 
-                due = False
-                if freq == "hourly":
-                    due = last_msk is None or (now - last_msk) >= timedelta(hours=1)
-                    window_h = 6
-                elif freq == "daily":
-                    due = now.hour == 9 and (last_msk is None or last_msk.date() < now.date())
-                    window_h = 36
-                elif freq == "twice":
-                    due = now.hour in (9, 18) and (
-                        last_msk is None
-                        or last_msk.date() < now.date()
-                        or last_msk.hour != now.hour
-                    )
-                    window_h = 18
-                else:
-                    due = last_msk is None or (now - last_msk) >= timedelta(hours=1)
-                    window_h = 6
-                if not due:
+                window_h = {"hourly": 6, "daily": 36, "twice": 18}.get(freq, 6)
+                if not _digest_due(freq, last_msk, now):
                     return
 
                 thr = 7
@@ -2583,6 +2763,7 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(_mark("hourly", "Раз в час"), callback_data="s_ears_hourly")],
             [InlineKeyboardButton(_mark("daily", "Раз в день"), callback_data="s_ears_daily")],
             [InlineKeyboardButton(_mark("twice", "2 раза в день"), callback_data="s_ears_twice")],
+            [InlineKeyboardButton(_mark("instant", "⚡ Мгновенно"), callback_data="s_ears_instant")],
             [InlineKeyboardButton("◀️ Профиль", callback_data="menu_profile")],
         ])
         await query.edit_message_text(
@@ -2590,12 +2771,17 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Вакансии копятся и приходят пачкой (не по одной).\n"
             "• Раз в час — свежий дайджест каждый час\n"
             "• Раз в день — утром (~09:00 МСК)\n"
-            "• 2 раза в день — утром и вечером (~09:00 и 18:00 МСК)\n\n"
+            "• 2 раза в день — утром и вечером (~09:00 и 18:00 МСК)\n"
+            "• ⚡ Мгновенно — каждая новая вакансия с вашим скором приходит сразу\n"
+            "  (тихие часы 23–08 МСК действуют)\n\n"
             "Сначала включите «Пуши», потом выберите частоту.",
             reply_markup=kb,
         )
-    elif data in ("s_ears_hourly", "s_ears_daily", "s_ears_twice"):
-        freq = {"s_ears_hourly": "hourly", "s_ears_daily": "daily", "s_ears_twice": "twice"}[data]
+    elif data in ("s_ears_hourly", "s_ears_daily", "s_ears_twice", "s_ears_instant"):
+        freq = {
+            "s_ears_hourly": "hourly", "s_ears_daily": "daily",
+            "s_ears_twice": "twice", "s_ears_instant": "instant",
+        }[data]
         try:
             if hasattr(db, "set_ears_freq"):
                 await db.set_ears_freq(freq)
@@ -2604,11 +2790,138 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await query.answer(f"Ошибка: {e}", show_alert=True)
             return
-        label = {"hourly": "раз в час", "daily": "раз в день", "twice": "2 раза в день"}[freq]
+        label = {
+            "hourly": "раз в час", "daily": "раз в день",
+            "twice": "2 раза в день", "instant": "мгновенно",
+        }[freq]
         text, keyboard = await _profile_text_and_keyboard()
         await query.edit_message_text(
             text=f"⏱ Частота пушей: {label}\n\n{text}",
             reply_markup=keyboard,
+        )
+
+    # ── Мои хотелки (per-user wish profile) ─────────────────────────────────
+    elif data == "s_wish":
+        text, keyboard = await _wish_screen(chat_id)
+        await query.edit_message_text(text=text, reply_markup=keyboard)
+
+    elif data == "s_wish_role":
+        context.user_data["awaiting_wish_role"] = True
+        await query.edit_message_text(
+            "🎯 Пришлите роль/должность сообщением.\n"
+            "Пример: Руководитель IT проектов\n\n"
+            "Отмена — кнопка ниже.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Хотелки", callback_data="s_wish")]]),
+        )
+
+    elif data == "s_wish_money":
+        context.user_data["awaiting_wish_money"] = True
+        await query.edit_message_text(
+            "💰 Пришлите вилку зарплаты числами, тыс ₽.\n"
+            "Примеры: «от 250» · «до 400» · «от 250 до 400»\n"
+            "Чтобы убрать — пришлите «нет».\n\n"
+            "Отмена — кнопка ниже.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Хотелки", callback_data="s_wish")]]),
+        )
+
+    elif data == "s_wish_exclude":
+        context.user_data["awaiting_wish_exclude"] = True
+        await query.edit_message_text(
+            "🚫 Пришлите слова/роли через запятую — такие вакансии показываться не будут "
+            "только вам (без влияния на других).\n"
+            "Пример: продажи, строительство, стажёр\n"
+            "Чтобы убрать — пришлите «нет».\n\n"
+            "Отмена — кнопка ниже.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Хотелки", callback_data="s_wish")]]),
+        )
+
+    elif data == "s_wish_format":
+        cur = (await db.get_wish_profile_for_chat(chat_id)).get("wish_format") if hasattr(db, "get_wish_profile_for_chat") else "any"
+        def _m(v, l):
+            return ("✅ " if cur == v else "") + l
+        await query.edit_message_text(
+            "🏠 Формат работы",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_m("any", "Любой"), callback_data="s_wish_fmt_any")],
+                [InlineKeyboardButton(_m("remote", "Удалёнка"), callback_data="s_wish_fmt_remote")],
+                [InlineKeyboardButton(_m("office", "Офис"), callback_data="s_wish_fmt_office")],
+                [InlineKeyboardButton(_m("hybrid", "Гибрид"), callback_data="s_wish_fmt_hybrid")],
+                [InlineKeyboardButton("◀️ Хотелки", callback_data="s_wish")],
+            ]),
+        )
+
+    elif data.startswith("s_wish_fmt_"):
+        val = data[len("s_wish_fmt_"):]
+        try:
+            await db.set_wish_for_chat(chat_id, "wish_format", val)
+        except Exception as e:
+            await query.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        text, keyboard = await _wish_screen(chat_id)
+        await query.edit_message_text(text=f"✅ Формат обновлён\n\n{text}", reply_markup=keyboard)
+
+    elif data == "s_wish_exp":
+        cur = (await db.get_wish_profile_for_chat(chat_id)).get("wish_experience") if hasattr(db, "get_wish_profile_for_chat") else "any"
+        def _m2(v, l):
+            return ("✅ " if cur == v else "") + l
+        await query.edit_message_text(
+            "🎓 Опыт работы (фильтр hh, только для ваших поисков)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_m2("any", "Любой"), callback_data="s_wish_exp_any")],
+                [InlineKeyboardButton(_m2("between1And3", "1–3 года"), callback_data="s_wish_exp_between1And3")],
+                [InlineKeyboardButton(_m2("between3And6", "3–6 лет"), callback_data="s_wish_exp_between3And6")],
+                [InlineKeyboardButton(_m2("moreThan6", "6+ лет"), callback_data="s_wish_exp_moreThan6")],
+                [InlineKeyboardButton("◀️ Хотелки", callback_data="s_wish")],
+            ]),
+        )
+
+    elif data.startswith("s_wish_exp_"):
+        val = data[len("s_wish_exp_"):]
+        try:
+            await db.set_wish_for_chat(chat_id, "wish_experience", val)
+        except Exception as e:
+            await query.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        text, keyboard = await _wish_screen(chat_id)
+        await query.edit_message_text(text=f"✅ Опыт обновлён\n\n{text}", reply_markup=keyboard)
+
+    elif data == "s_wish_loc":
+        cur = (await db.get_wish_profile_for_chat(chat_id)).get("wish_location") if hasattr(db, "get_wish_profile_for_chat") else "any"
+        def _m3(v, l):
+            return ("✅ " if cur == v else "") + l
+        await query.edit_message_text(
+            "📍 Регион (для офисных/гибридных вакансий)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_m3("any", "Любой"), callback_data="s_wish_loc_any")],
+                [InlineKeyboardButton(_m3("moscow", "Москва"), callback_data="s_wish_loc_moscow")],
+                [InlineKeyboardButton(_m3("spb", "Санкт-Петербург"), callback_data="s_wish_loc_spb")],
+                [InlineKeyboardButton("◀️ Хотелки", callback_data="s_wish")],
+            ]),
+        )
+
+    elif data.startswith("s_wish_loc_"):
+        val = data[len("s_wish_loc_"):]
+        try:
+            await db.set_wish_for_chat(chat_id, "wish_location", val)
+        except Exception as e:
+            await query.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        text, keyboard = await _wish_screen(chat_id)
+        await query.edit_message_text(text=f"✅ Регион обновлён\n\n{text}", reply_markup=keyboard)
+
+    # ── Диагностика «почему мало вакансий» ──────────────────────────────────
+    elif data == "s_whyfew":
+        text = await _whyfew_text(chat_id)
+        await query.edit_message_text(
+            text=text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Хотелки", callback_data="s_wish")],
+                [
+                    InlineKeyboardButton("🔍 Слова", callback_data="s_kw"),
+                    InlineKeyboardButton("📢 Каналы", callback_data="s_ch"),
+                ],
+                [InlineKeyboardButton("◀️ Профиль", callback_data="menu_profile")],
+            ]),
         )
 
 
@@ -2674,10 +2987,33 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, k in enumerate(kws[:30]):
             label = k if len(k) <= 40 else k[:37] + "..."
             rows.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"kw_del_{i}")])
+        rows.append([InlineKeyboardButton("🔎 Проверить слова", callback_data="kw_check")])
         rows.append([InlineKeyboardButton("➕ Добавить слово", callback_data="s_kw_add")])
         rows.append([InlineKeyboardButton("📥 Из резюме", callback_data="s_kw_from_resume")])
         rows.append([InlineKeyboardButton("◀️ Настройки", callback_data="menu_settings")])
         await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "kw_check":
+        from title_filter import keywords_feedback
+
+        kws = await db.get_keywords() or []
+        if not kws:
+            await query.edit_message_text("🔍 Слов пока нет — добавьте через «➕ Добавить слово».")
+            return
+        icons = {"ok": "✅", "broad": "⚠️", "rejected": "❌"}
+        lines = []
+        for k, status, reason in keywords_feedback(kws):
+            line = f"{icons.get(status, '•')} {k}"
+            if status != "ok":
+                line += f"\n    {reason}"
+            lines.append(line)
+        ok_n = sum(1 for _, s, _ in keywords_feedback(kws) if s == "ok")
+        text = f"🔎 Проверка слов: ищется {ok_n} из {len(kws)}\n\n" + "\n".join(lines)
+        rows = [
+            [InlineKeyboardButton("➕ Добавить слово", callback_data="s_kw_add")],
+            [InlineKeyboardButton("◀️ К словам", callback_data="s_kw")],
+        ]
+        await query.edit_message_text(text=text[:3900], reply_markup=InlineKeyboardMarkup(rows))
 
     elif data.startswith("kw_del_"):
         try:
@@ -3692,6 +4028,49 @@ async def _wrapped_handle_message(update, context):
                 await update.message.reply_text(f"❌ Не удалось добавить: {e}")
             return
 
+    if context.user_data.get("awaiting_wish_role"):
+        word = text.strip()
+        context.user_data.pop("awaiting_wish_role", None)
+        if word and not word.startswith("/"):
+            try:
+                await db.set_wish_for_chat(update.effective_chat.id, "wish_role", word)
+                t, kb = await _wish_screen(update.effective_chat.id)
+                await update.message.reply_text(f"✅ Роль сохранена\n\n{t}", reply_markup=kb)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Не удалось сохранить: {e}")
+        return
+
+    if context.user_data.get("awaiting_wish_money"):
+        word = text.strip()
+        context.user_data.pop("awaiting_wish_money", None)
+        if word and not word.startswith("/"):
+            try:
+                if word.lower() in ("нет", "none", "удалить", "сброс"):
+                    await db.set_wish_for_chat(update.effective_chat.id, "wish_salary_min", "")
+                    await db.set_wish_for_chat(update.effective_chat.id, "wish_salary_max", "")
+                else:
+                    lo, hi = _parse_salary_range(word)
+                    await db.set_wish_for_chat(update.effective_chat.id, "wish_salary_min", str(lo) if lo else "")
+                    await db.set_wish_for_chat(update.effective_chat.id, "wish_salary_max", str(hi) if hi else "")
+                t, kb = await _wish_screen(update.effective_chat.id)
+                await update.message.reply_text(f"✅ Зарплата сохранена\n\n{t}", reply_markup=kb)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Не удалось сохранить: {e}")
+        return
+
+    if context.user_data.get("awaiting_wish_exclude"):
+        word = text.strip()
+        context.user_data.pop("awaiting_wish_exclude", None)
+        if word and not word.startswith("/"):
+            try:
+                val = "" if word.lower() in ("нет", "none", "удалить", "сброс") else word
+                await db.set_wish_for_chat(update.effective_chat.id, "wish_exclude", val)
+                t, kb = await _wish_screen(update.effective_chat.id)
+                await update.message.reply_text(f"✅ Исключения сохранены\n\n{t}", reply_markup=kb)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Не удалось сохранить: {e}")
+        return
+
     if context.user_data.get("awaiting_keyword"):
         word = text.strip()
         _menu_labels = {
@@ -3707,9 +4086,21 @@ async def _wrapped_handle_message(update, context):
             return
         else:
             context.user_data.pop("awaiting_keyword", None)
+            from title_filter import explain_keyword
+
+            status, reason = explain_keyword(word)
+            if status == "rejected":
+                await update.message.reply_text(
+                    f"❌ «{word}» не добавлено.\n{reason}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Другое слово", callback_data="s_kw_add")]]),
+                )
+                return
             try:
                 await db.add_keyword(word)
-                await update.message.reply_text(f"✅ Добавлено: {word}")
+                if status == "broad":
+                    await update.message.reply_text(f"⚠️ Добавлено: {word}\n{reason}")
+                else:
+                    await update.message.reply_text(f"✅ Добавлено: {word}")
                 kws = await db.get_keywords()
                 text_k = ("🔍 Ключевые слова:" + chr(10) + (chr(10)).join(f"• {k}" for k in kws)) if kws else "🔍 Ключевых слов пока нет."
                 rows = []
@@ -4060,6 +4451,12 @@ def main():
         ears_digest_job,
         interval=15 * 60,
         first=90,
+    )
+
+    app.job_queue.run_repeating(
+        backfill_job,
+        interval=int(os.getenv("BACKFILL_JOB_SEC", str(2 * 60 * 60))),
+        first=10 * 60,  # first pass 10 min after start
     )
 
     app.add_handler(CommandHandler("menu_old", cmd_menu_old))

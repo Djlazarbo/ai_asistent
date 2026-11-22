@@ -193,6 +193,69 @@ def user_is_pm_searcher(keywords: list[str]) -> bool:
     return bool(_PM_SEARCHER.search(_norm(blob)))
 
 
+# ── keyword save feedback (onboarding / "проверить мои слова") ────────────────
+
+# Tokens that alone say nothing about the role's domain — a keyword made only
+# of these matches every industry ("Руководитель отдела", "Менеджер проектов").
+_GENERIC_ROLE_TOKENS = {
+    "руководитель", "руководителя", "менеджер", "менеджера", "проектов",
+    "проекта", "проект", "отдела", "отдел", "старший", "ведущий", "junior",
+    "middle", "senior", "lead", "head", "chief", "project", "manager",
+    "program", "директор", "специалист", "начальник", "заведующий",
+}
+
+
+def _is_broad_keyword(kw: str) -> bool:
+    toks = [t for t in _tokens(kw) if t not in _STOP]
+    if not toks:
+        return True
+    if not any(t in _GENERIC_ROLE_TOKENS for t in toks):
+        return False
+    # broad only if EVERY token is generic (no IT/domain/level qualifier)
+    return all(t in _GENERIC_ROLE_TOKENS for t in toks)
+
+
+def explain_keyword(keyword: str) -> tuple[str, str]:
+    """(status, reason) for a user keyword. status: ok | broad | rejected.
+
+    Mirrors is_search_keyword() so users finally SEE why a word is silently
+    dropped from searches instead of guessing.
+    """
+    k = (keyword or "").strip()
+    n = _norm(k)
+    if not k:
+        return "rejected", "пустое слово"
+    if len(k) < 4:
+        return "rejected", "слишком короткое (минимум 4 символа)"
+    if len(k) > 60:
+        return "rejected", "слишком длинное (максимум 60 символов)"
+    if n in {"рукодитель", "аккредитованная", "аккредитованный"}:
+        return "rejected", "опечатка/мусорное слово"
+    if n.startswith(_DUTY_PREFIX):
+        return (
+            "rejected",
+            "это описание обязанностей, а не роль — поиски по нему не будет. "
+            "Укажите роль: например «Руководитель IT проектов», а не «Управление проектами»",
+        )
+    if _DUTY_OR_GENERIC.search(n):
+        return (
+            "rejected",
+            "слишком общая фраза-обязанность, поиск по ней не ведётся. Уточните роль",
+        )
+    if _is_broad_keyword(k):
+        return (
+            "broad",
+            "очень широкое — поймает массу нерелевантного со всех отраслей. "
+            "Добавьте уточнение: сферу (IT/строительство…), уровень или технологию",
+        )
+    return "ok", ""
+
+
+def keywords_feedback(keywords: list[str]) -> list[tuple[str, str, str]]:
+    """[(keyword, status, reason)] for a user's stored keywords."""
+    return [(k, *explain_keyword(k)) for k in (keywords or [])]
+
+
 def keyword_hits_title(keyword: str, title: str) -> bool:
     kw = _norm(keyword)
     title_n = _norm(title)

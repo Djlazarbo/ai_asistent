@@ -6,6 +6,11 @@ cd "$(dirname "$0")/.."
 APP_DIR="$(pwd)"
 
 echo "==> Deploy in $APP_DIR"
+VER="$(tr -d ' \t\r\n' < VERSION)"
+SHA="$(git rev-parse --short HEAD)"
+export APP_VERSION="$VER"
+export APP_GIT_SHA="$SHA"
+echo "Release $VER git $SHA"
 git rev-parse --short HEAD
 
 if [ ! -f .env ] || [ ! -f config.yaml ]; then
@@ -28,11 +33,17 @@ if [ ! -f data/telethon_session.session ]; then
 fi
 
 echo "==> Build & start Docker images"
-docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
+docker compose -f docker-compose.prod.yml build \
+  --build-arg APP_VERSION="$VER" \
+  --build-arg APP_GIT_SHA="$SHA"
+docker compose -f docker-compose.prod.yml up -d --remove-orphans
+docker tag jobhunter-app:latest "jobhunter-app:${VER}"
+docker tag jobhunter-poller:latest "jobhunter-poller:${VER}"
 
 echo "==> Health"
 sleep 3
 curl -fsS http://127.0.0.1:5679/health || true
 docker compose -f docker-compose.prod.yml ps
+echo "==> Images tagged jobhunter-app:${VER} jobhunter-poller:${VER}"
 
-echo "==> Deploy OK $(date -Is)"
+echo "==> Deploy OK $VER $(date -Is)"

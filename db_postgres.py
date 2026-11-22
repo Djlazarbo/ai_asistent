@@ -1488,7 +1488,7 @@ async def get_interview_history(limit: int = 10, chat_id: int | None = None) -> 
 
 
 # === EARS_FREQ ===
-_EARS_ALLOWED = ("hourly", "daily", "twice")
+_EARS_ALLOWED = ("hourly", "daily", "twice", "instant")
 
 
 
@@ -1589,6 +1589,132 @@ async def get_digest_meta_for_chat(chat_id: int) -> dict:
 async def touch_digest_meta_for_chat(chat_id: int, vacancy_ids: list) -> None:
     import user_data
     await _conn_call(user_data.touch_digest_meta, int(chat_id), vacancy_ids)
+
+
+# === WISH_PROFILE (per-user «хотелки»: роль, вилка, формат, опыт, регион, исключения) ===
+_WISH_FORMATS = ("any", "remote", "office", "hybrid")
+_WISH_EXPERIENCES = ("any", "between1And3", "between3And6", "moreThan6")
+_WISH_LOCATIONS = ("any", "moscow", "spb")
+
+_WISH_LABELS = {
+    "wish_format": {"any": "любой", "remote": "удалёнка", "office": "офис", "hybrid": "гибрид"},
+    "wish_experience": {
+        "any": "любой", "between1And3": "1–3 года", "between3And6": "3–6 лет", "moreThan6": "6+ лет",
+    },
+    "wish_location": {"any": "любой", "moscow": "Москва", "spb": "Санкт-Петербург"},
+}
+
+
+def wish_label(field: str, value: str | None) -> str:
+    m = _WISH_LABELS.get(field)
+    if m and (value or "any") in m:
+        return m[value or "any"]
+    return (value or "").strip() or "—"
+
+
+async def get_wish_profile_for_chat(chat_id: int) -> dict:
+    """Per-user wish profile with sane defaults (nothing set == 'any')."""
+    import user_data
+
+    cid = int(chat_id)
+    out: dict = {
+        "wish_role": "",
+        "wish_salary_min": None,
+        "wish_salary_max": None,
+        "wish_format": "any",
+        "wish_experience": "any",
+        "wish_location": "any",
+        "wish_exclude": "",
+    }
+    for key in out:
+        try:
+            v = await _conn_call(user_data.get_user_setting, cid, key)
+        except Exception:
+            v = None
+        if v is None or str(v).strip() == "":
+            continue
+        if key in ("wish_salary_min", "wish_salary_max"):
+            try:
+                out[key] = int(str(v).strip())
+            except Exception:
+                pass
+        elif key == "wish_format":
+            v = str(v).strip().lower()
+            out[key] = v if v in _WISH_FORMATS else "any"
+        elif key == "wish_experience":
+            v = str(v).strip()
+            out[key] = v if v in _WISH_EXPERIENCES else "any"
+        elif key == "wish_location":
+            v = str(v).strip().lower()
+            out[key] = v if v in _WISH_LOCATIONS else "any"
+        else:
+            out[key] = str(v).strip()
+    # default role from resume profile if not set
+    if not out["wish_role"]:
+        try:
+            profile = await _conn_call(user_data.get_user_profile, cid)
+            if isinstance(profile, dict):
+                out["wish_role"] = str(
+                    profile.get("target_role") or profile.get("role") or ""
+                ).strip()
+        except Exception:
+            pass
+    return out
+
+
+async def set_wish_for_chat(chat_id: int, field: str, value) -> str:
+    """Validate + persist one wish field. Returns normalized value ('' clears)."""
+    import user_data
+
+    cid = int(chat_id)
+    field = (field or "").strip()
+    v = ("" if value is None else str(value)).strip()
+    if field in ("wish_salary_min", "wish_salary_max"):
+        if v == "":
+            normalized = ""
+        else:
+            digits = "".join(ch for ch in v if ch.isdigit())
+            normalized = str(int(digits)) if digits else ""
+    elif field == "wish_format":
+        normalized = v.lower() if v.lower() in _WISH_FORMATS else "any"
+    elif field == "wish_experience":
+        normalized = v if v in _WISH_EXPERIENCES else "any"
+    elif field == "wish_location":
+        normalized = v.lower() if v.lower() in _WISH_LOCATIONS else "any"
+    elif field in ("wish_role", "wish_exclude"):
+        normalized = v[:200]
+    else:
+        raise ValueError(f"unknown wish field: {field}")
+    await _conn_call(user_data.set_user_setting, cid, field, normalized)
+    return normalized
+
+
+async def user_feed_stats_7d_for_chat(chat_id: int) -> dict:
+    """Diagnostics: user's feed growth + the shared pool it draws from."""
+    async def _q(conn):
+        uv = await conn.fetch(
+            """
+            SELECT status, COUNT(*) AS n
+            FROM user_vacancies
+            WHERE chat_id=$1 AND created_at > NOW() - INTERVAL '7 days'
+            GROUP BY status
+            """,
+            int(chat_id),
+        )
+        pool = await conn.fetchval(
+            "SELECT COUNT(*) FROM vacancies_pool WHERE created_at > NOW() - INTERVAL '7 days'"
+        )
+        return (
+            {str(r["status"]): int(r["n"]) for r in uv},
+            int(pool or 0),
+        )
+
+    uv_by_status, pool_7d = await _conn_call(_q)
+    return {
+        "uv_7d": uv_by_status,
+        "uv_total_7d": sum(uv_by_status.values()),
+        "pool_7d": pool_7d,
+    }
 
 
 # === COMPANIES_BLOCK_WANT ===

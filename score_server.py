@@ -490,6 +490,7 @@ async def _jh_notify_if_new(chat_id, vacancy, status, score=None, reason="", vac
         except Exception:
             pass
         # Ears digest modes: no per-vacancy instant push (hourly/daily/twice).
+        # 'instant' users get the push right here (tg_notify).
         try:
             freq = "hourly"
             if hasattr(db, "get_ears_freq_for_chat"):
@@ -498,6 +499,21 @@ async def _jh_notify_if_new(chat_id, vacancy, status, score=None, reason="", vac
                 freq = await db.get_ears_freq()
             if str(freq).lower() in ("hourly", "daily", "twice", "1h", "1d", "2d"):
                 return False
+        except Exception:
+            pass
+        # Quiet hours (MSK 23:00–08:00 by default) apply to instant pushes too.
+        try:
+            qh = "on"
+            if hasattr(db, "get_quiet_hours_for_chat"):
+                qh = await db.get_quiet_hours_for_chat(int(chat_id))
+            elif hasattr(db, "get_quiet_hours"):
+                qh = await db.get_quiet_hours()
+            if qh != "off":
+                from datetime import datetime, timedelta, timezone
+
+                hour_msk = datetime.now(timezone(timedelta(hours=3))).hour
+                if hour_msk >= 23 or hour_msk < 8:
+                    return False
         except Exception:
             pass
         # Company blocklist

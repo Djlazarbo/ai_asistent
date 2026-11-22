@@ -7,11 +7,11 @@ APP_DIR="$(pwd)"
 
 echo "==> Deploy in $APP_DIR"
 VER="$(tr -d ' \t\r\n' < VERSION)"
-SHA="$(git rev-parse --short HEAD)"
+# Manual deploys (git archive over SSH, no .git on the host) fall back to "manual"
+SHA="$(git rev-parse --short HEAD 2>/dev/null || echo manual)"
 export APP_VERSION="$VER"
 export APP_GIT_SHA="$SHA"
 echo "Release $VER git $SHA"
-git rev-parse --short HEAD
 
 if [ ! -f .env ] || [ ! -f config.yaml ]; then
   echo "Missing .env or config.yaml — abort"

@@ -1443,23 +1443,10 @@ async def _run_searchnow(msg, progress_callback=None):
 
 @owner_only
 async def cmd_searchnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
     msg = await update.effective_message.reply_text("🔍 Запускаю поиск hh.ru + Хабр…")
-
-    async def progress(t: str):
-        await _edit_search_progress(msg, t)
-
-    try:
-        text_out, _ok = await _execute_search_now(chat.id if chat else None, progress_callback=progress)
-        await msg.edit_text(
-            _format_search_result(text_out),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Посмотреть", callback_data="source_all_0")],
-                [InlineKeyboardButton("🏠 Сегодня", callback_data="menu_main")],
-            ]),
-        )
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
+    # Search runs in a background task — awaiting it inline froze the whole
+    # bot for every user (sequential update processing, 10-30 min search).
+    _spawn_search(update.effective_chat.id if update.effective_chat else None, msg)
 
 
 @owner_only
@@ -2364,21 +2351,7 @@ async def _handle_menu_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             text="🔍 Запускаю поиск hh.ru + Хабр + Getmatch...",
         )
-
-        async def progress(t: str):
-            await _edit_search_progress(msg, t)
-
-        try:
-            text_out, _ok = await _execute_search_now(chat_id, progress_callback=progress)
-            await msg.edit_text(
-                _format_search_result(text_out),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Посмотреть", callback_data="source_all_0")],
-                    [InlineKeyboardButton("🏠 Сегодня", callback_data="menu_main")],
-                ]),
-            )
-        except Exception as e:
-            await msg.edit_text(f"❌ Ошибка: {e}")
+        _spawn_search(chat_id, msg)
 
     elif data == "menu_stats":
         text = await _stats_funnel_text()
@@ -3808,20 +3781,7 @@ async def _wrapped_handle_message(update, context):
         return
     if text in ("🔍 Искать сейчас", "Искать сейчас", "🔍 Поиск", "Поиск"):
         msg = await update.message.reply_text("🔍 Запускаю поиск hh.ru + Хабр + Getmatch...")
-
-        async def progress(t: str):
-            await _edit_search_progress(msg, t)
-
-        try:
-            text_out, _ok = await _execute_search_now(update.effective_chat.id, progress_callback=progress)
-            await msg.edit_text(
-                _format_search_result(text_out),
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Посмотреть", callback_data="source_all_0")],
-                ]),
-            )
-        except Exception as e:
-            await msg.edit_text(f"❌ Ошибка: {e}")
+        _spawn_search(update.effective_chat.id, msg)
     elif text in ("📊 Статистика", "Статистика", "📊 Сводка"):
         await cmd_stats(update, context)
         return
@@ -4058,6 +4018,9 @@ def main():
         .token(BOT_TOKEN)
         .request(request)
         .get_updates_request(request)
+        # Process updates concurrently: one slow handler (search, AI letter)
+        # must not freeze the bot for other users.
+        .concurrent_updates(True)
         .post_init(post_init)
         .build()
     )
@@ -4390,6 +4353,53 @@ async def _execute_search_now(chat_id: int | None, progress_callback=None) -> tu
         msg = "Поиск недоступен." + chr(10) + "Poller: " + str(note) + chr(10) + "Light: " + str(e)
         return msg, False
 
+
+
+_search_tasks: dict[int, asyncio.Task] = {}
+
+
+def _spawn_search(chat_id: int | None, msg, with_menu_button: bool = True) -> asyncio.Task:
+    """Run the user search in a background task; the handler returns immediately.
+
+    PTB processes updates sequentially by default, and a search can run
+    10-30 minutes — awaiting it inline froze the whole bot for every user.
+    Progress and the final result are delivered by editing `msg` from the task.
+    """
+    cid = int(chat_id or 0)
+
+    old = _search_tasks.get(cid)
+    if old and not old.done():
+        async def _already():
+            try:
+                await msg.edit_text("⏳ Поиск уже идёт — следите за сообщением выше.")
+            except Exception:
+                pass
+        return asyncio.create_task(_already())
+
+    async def _job():
+        async def progress(t: str):
+            await _edit_search_progress(msg, t)
+        try:
+            text_out, _ok = await _execute_search_now(cid or None, progress_callback=progress)
+            buttons = [InlineKeyboardButton("📋 Посмотреть", callback_data="source_all_0")]
+            if with_menu_button:
+                buttons.append(InlineKeyboardButton("🏠 Сегодня", callback_data="menu_main"))
+            await msg.edit_text(
+                _format_search_result(text_out),
+                reply_markup=InlineKeyboardMarkup([buttons]),
+            )
+        except Exception as e:
+            logger.error(f"search task failed chat={cid}: {e}")
+            try:
+                await msg.edit_text(f"❌ Ошибка: {e}")
+            except Exception:
+                pass
+        finally:
+            _search_tasks.pop(cid, None)
+
+    task = asyncio.create_task(_job())
+    _search_tasks[cid] = task
+    return task
 
 
 async def _search_now_via_poller(chat_id: int | None = None, progress_callback=None) -> tuple[bool, str]:
